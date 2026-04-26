@@ -169,6 +169,14 @@ pub struct LastTradePrice {
     pub size: Option<Decimal>,
     /// Fee rate in basis points
     pub fee_rate_bps: Option<Decimal>,
+    /// On-chain transaction hash for the trade.
+    ///
+    /// Polymarket emits `last_trade_price` events with this field populated
+    /// after the matching engine settles the fill on-chain. May be absent or
+    /// empty for very early ticks before settlement.
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub transaction_hash: Option<B256>,
     /// Unix timestamp in milliseconds
     #[serde_as(as = "DisplayFromStr")]
     pub timestamp: i64,
