@@ -136,6 +136,38 @@ impl Client<Unauthenticated> {
 
 // Methods available in any state
 impl<S: State> Client<S> {
+    /// Subscribes to the raw market data stream, yielding all `WsMessage` variants
+    /// in wire order from a single underlying broadcast channel.
+    ///
+    /// Unlike the typed `subscribe_orderbook` / `subscribe_prices` / etc. methods —
+    /// which each `filter_map` to a single variant and would require `select_all`
+    /// composition that re-orders events at the consumer — this method preserves
+    /// strict wire ordering across event types (e.g. a `Book` snapshot arriving
+    /// before a `PriceChange` is always yielded first).
+    ///
+    /// When `custom_features` is true, additionally enables `BestBidAsk`,
+    /// `NewMarket`, and `MarketResolved` variants (server must support them).
+    ///
+    /// # Arguments
+    ///
+    /// * `asset_ids` - List of asset/token IDs to monitor
+    /// * `custom_features` - Enable extended message variants
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created or the WebSocket
+    /// connection is not established.
+    pub fn subscribe_market_raw(
+        &self,
+        asset_ids: Vec<U256>,
+        custom_features: bool,
+    ) -> Result<impl Stream<Item = Result<WsMessage>> + use<S>> {
+        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
+        resources
+            .subscriptions
+            .subscribe_market_with_options(asset_ids, custom_features)
+    }
+
     /// Subscribes to real-time orderbook updates for specified market assets.
     ///
     /// Returns a stream of orderbook snapshots showing all bid and ask levels.
