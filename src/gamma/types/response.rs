@@ -334,6 +334,11 @@ pub struct Event {
     pub cumulative_markets: Option<bool>,
     pub away_team_name: Option<String>,
     pub home_team_name: Option<String>,
+    /// Free-form metadata block (e.g. `priceToBeat`, `finalPrice` for crypto
+    /// up/down markets). Preserved as raw JSON so consumers can extract
+    /// strategy-specific fields without forcing a schema change here.
+    #[serde(default, rename = "eventMetadata")]
+    pub event_metadata: Option<serde_json::Value>,
 }
 
 /// A prediction market.

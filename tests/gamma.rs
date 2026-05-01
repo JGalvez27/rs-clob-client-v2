@@ -442,6 +442,29 @@ mod events {
 
         Ok(())
     }
+
+    #[test]
+    fn event_deserializes_event_metadata() {
+        let raw = serde_json::json!({
+            "id": "1",
+            "slug": "btc-updown-5m-1714500000",
+            "eventMetadata": { "priceToBeat": 67234.5, "finalPrice": 67240.25 }
+        });
+        let ev: polymarket_client_sdk_v2::gamma::types::response::Event =
+            serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            ev.event_metadata.as_ref().unwrap()["priceToBeat"].as_f64(),
+            Some(67234.5)
+        );
+    }
+
+    #[test]
+    fn event_missing_event_metadata_is_none() {
+        let raw = serde_json::json!({"id": "1", "slug": "x"});
+        let ev: polymarket_client_sdk_v2::gamma::types::response::Event =
+            serde_json::from_value(raw).unwrap();
+        assert!(ev.event_metadata.is_none());
+    }
 }
 
 mod markets {
