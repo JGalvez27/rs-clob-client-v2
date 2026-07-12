@@ -361,6 +361,11 @@ pub enum TickSize {
     QuarterCent,
     Thousandth,
     TenThousandth,
+    /// A minimum price increment that this SDK version has no named variant for.
+    /// The raw value is preserved so callers can still quantize and validate against
+    /// it. Only produced for values in the open interval `(0, 1)`; see the
+    /// [`TryFrom<Decimal>`](TickSize#impl-TryFrom<Decimal>-for-TickSize) impl.
+    Other(Decimal),
 }
 
 impl fmt::Display for TickSize {
@@ -372,6 +377,7 @@ impl fmt::Display for TickSize {
             TickSize::QuarterCent => "QuarterCent",
             TickSize::Thousandth => "Thousandth",
             TickSize::TenThousandth => "TenThousandth",
+            TickSize::Other(_) => "Other",
         };
 
         write!(f, "{name}({})", self.as_decimal())
@@ -388,6 +394,7 @@ impl TickSize {
             TickSize::QuarterCent => dec!(0.0025),
             TickSize::Thousandth => dec!(0.001),
             TickSize::TenThousandth => dec!(0.0001),
+            TickSize::Other(value) => *value,
         }
     }
 }
@@ -409,8 +416,24 @@ impl TryFrom<Decimal> for TickSize {
             v if v == dec!(0.0025) => Ok(TickSize::QuarterCent),
             v if v == dec!(0.001) => Ok(TickSize::Thousandth),
             v if v == dec!(0.0001) => Ok(TickSize::TenThousandth),
+            // Forward compatibility: Polymarket has changed the tick-size set
+            // more than once. Preserve an unrecognized but in-range value in
+            // `Other` instead of failing the whole response deserialization,
+            // so a newly-introduced tick does not make a market's book
+            // undeserializable (and therefore invisible) to the client. A value
+            // outside `(0, 1)` is not a valid increment for a `[0, 1]`-priced
+            // market, so it still fails loud rather than being coerced.
+            v if v > Decimal::ZERO && v < Decimal::ONE => {
+                #[cfg(feature = "tracing")]
+                tracing::warn!(
+                    tick_size = %v,
+                    "unrecognized Polymarket tick size; accepting as forward-compatible \
+                     TickSize::Other — add a named variant if this value is now standard"
+                );
+                Ok(TickSize::Other(v))
+            }
             other => Err(Error::validation(format!(
-                "Unknown tick size: {other}. Expected one of: 0.1, 0.01, 0.005, 0.0025, 0.001, 0.0001"
+                "Invalid tick size: {other}. Must be within the open interval (0, 1)"
             ))),
         }
     }
@@ -986,15 +1009,40 @@ mod tests {
     }
 
     #[test]
-    fn non_standard_decimal_to_tick_size_should_fail() {
-        let result = TickSize::try_from(Decimal::ONE);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Unknown tick size: 1")
-        );
+    fn out_of_range_decimal_to_tick_size_should_fail() {
+        for bad in [Decimal::ONE, Decimal::ZERO, dec!(-0.01), dec!(2)] {
+            let result = TickSize::try_from(bad);
+            assert!(result.is_err(), "{bad} should be rejected as a tick size");
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Invalid tick size"),
+                "{bad} should fail with the out-of-range message"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_in_range_decimal_becomes_other() {
+        // A tick that has no named variant here must parse into `Other` rather
+        // than fail, so the enclosing response still deserializes. Named ticks
+        // keep their variants.
+        let future = TickSize::try_from(dec!(0.0005)).unwrap();
+        assert!(matches!(future, TickSize::Other(v) if v == dec!(0.0005)));
+        assert_eq!(future.as_decimal(), dec!(0.0005));
+        assert!(matches!(
+            TickSize::try_from(dec!(0.0025)).unwrap(),
+            TickSize::QuarterCent
+        ));
+    }
+
+    #[test]
+    fn other_tick_size_round_trips_and_displays() {
+        let tick = TickSize::try_from(dec!(0.0005)).unwrap();
+        let as_dec: Decimal = tick.into();
+        assert_eq!(as_dec, dec!(0.0005));
+        assert_eq!(format!("{tick}"), "Other(0.0005)");
     }
 
     #[test]
