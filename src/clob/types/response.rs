@@ -899,3 +899,34 @@ pub struct RfqQuote {
     /// Quoted price.
     pub price: Decimal,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+    use serde_json::json;
+
+    // Regression: a 0.0025 quarter-cent tick size must not fail `/book`
+    // deserialization. Before forward-compatible `TickSize` handling, an
+    // unrecognized tick rejected the whole `OrderBookSummaryResponse`, so
+    // 0.0025-tick markets produced no captured orderbook snapshots at all. The
+    // response must now deserialize, carrying the value in `TickSize::Other`.
+    #[test]
+    fn order_book_summary_accepts_quarter_cent_tick_size() {
+        let body = json!({
+            "market": "0x00000000000000000000000000000000000000000000000000000000aabbcc00",
+            "asset_id": "0x1",
+            "tick_size": "0.0025",
+            "min_order_size": "100",
+            "neg_risk": false,
+            "timestamp": "123456789",
+            "bids": [],
+            "asks": [],
+        });
+
+        let resp: OrderBookSummaryResponse =
+            serde_json::from_value(body).expect("0.0025-tick book should deserialize");
+        assert_eq!(resp.tick_size, TickSize::Other(dec!(0.0025)));
+        assert_eq!(Decimal::from(resp.tick_size), dec!(0.0025));
+    }
+}
