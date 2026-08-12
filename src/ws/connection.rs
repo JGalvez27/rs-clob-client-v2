@@ -5,6 +5,7 @@
 
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Instant;
 
 use backoff::backoff::Backoff as _;
@@ -57,6 +58,37 @@ impl ConnectionState {
     }
 }
 
+/// One incoming WebSocket text frame, byte-exact, captured BEFORE any typed
+/// parse. A valid-JSON frame with an unknown event/status/field shape still
+/// yields a `RawWsFrame`; a typed-parse failure never suppresses it.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct RawWsFrame {
+    /// The exact UTF-8 JSON payload as received on the wire.
+    pub json: Arc<str>,
+    /// Monotonic receipt instant, stamped in the read loop.
+    pub received_at: Instant,
+}
+
+/// Event on the raw-frame channel (see [`ConnectionManager::subscribe_raw`]).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum RawWsEvent {
+    /// A frame within the configured size limit (or no limit configured).
+    Frame(RawWsFrame),
+    /// A frame exceeding [`Config::max_frame_bytes`]. It was NOT parsed and
+    /// its payload is NOT carried (never truncated); consumers must treat
+    /// this as data loss.
+    ///
+    /// [`Config::max_frame_bytes`]: super::config::Config::max_frame_bytes
+    Oversized {
+        /// Actual frame length in bytes.
+        len: usize,
+        /// Configured maximum.
+        max: usize,
+    },
+}
+
 /// Manages WebSocket connection lifecycle, reconnection, and heartbeat.
 ///
 /// This generic connection manager handles all WebSocket connection concerns:
@@ -100,6 +132,8 @@ where
     sender_tx: mpsc::UnboundedSender<String>,
     /// Broadcast sender for incoming messages
     broadcast_tx: broadcast::Sender<M>,
+    /// Broadcast sender for raw pre-parse frames (see [`Self::subscribe_raw`])
+    raw_tx: broadcast::Sender<RawWsEvent>,
     /// Phantom data for unused type parameters
     _phantom: PhantomData<P>,
 }
@@ -117,12 +151,14 @@ where
     pub fn new(endpoint: String, config: Config, parser: P) -> Result<Self> {
         let (sender_tx, sender_rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (raw_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
 
         // Spawn connection task
         let connection_config = config;
         let connection_endpoint = endpoint;
         let broadcast_tx_clone = broadcast_tx.clone();
+        let raw_tx_clone = raw_tx.clone();
         let state_tx_clone = state_tx.clone();
 
         tokio::spawn(async move {
@@ -131,6 +167,7 @@ where
                 connection_config,
                 sender_rx,
                 broadcast_tx_clone,
+                raw_tx_clone,
                 parser,
                 state_tx_clone,
             )
@@ -142,6 +179,7 @@ where
             state_rx,
             sender_tx,
             broadcast_tx,
+            raw_tx,
             _phantom: PhantomData,
         })
     }
@@ -152,6 +190,7 @@ where
         config: Config,
         mut sender_rx: mpsc::UnboundedReceiver<String>,
         broadcast_tx: broadcast::Sender<M>,
+        raw_tx: broadcast::Sender<RawWsEvent>,
         parser: P,
         state_tx: watch::Sender<ConnectionState>,
     ) {
@@ -185,6 +224,7 @@ where
                         ws_stream,
                         &mut sender_rx,
                         &broadcast_tx,
+                        &raw_tx,
                         state_rx,
                         config.clone(),
                         &parser,
@@ -229,6 +269,7 @@ where
         ws_stream: WsStream,
         sender_rx: &mut mpsc::UnboundedReceiver<String>,
         broadcast_tx: &broadcast::Sender<M>,
+        raw_tx: &broadcast::Sender<RawWsEvent>,
         state_rx: watch::Receiver<ConnectionState>,
         config: Config,
         parser: &P,
@@ -239,6 +280,7 @@ where
         let (pong_tx, pong_rx) = watch::channel(Instant::now());
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
 
+        let max_frame_bytes = config.max_frame_bytes;
         let heartbeat_handle = tokio::spawn(async move {
             Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
         });
@@ -254,6 +296,33 @@ where
                         Ok(Message::Text(text)) => {
                             #[cfg(feature = "tracing")]
                             tracing::trace!(%text, "Received WebSocket text message");
+
+                            // Raw-frame tap (pre-parse). Size guard FIRST: an
+                            // oversized frame is surfaced as data loss and is
+                            // NOT parsed — a frame too large to journal must
+                            // not be acted on downstream.
+                            if let Some(max) = max_frame_bytes
+                                && text.len() > max
+                            {
+                                _ = raw_tx.send(RawWsEvent::Oversized {
+                                    len: text.len(),
+                                    max,
+                                });
+                                #[cfg(feature = "tracing")]
+                                tracing::error!(
+                                    len = text.len(),
+                                    max,
+                                    "WebSocket frame exceeds max_frame_bytes — not parsed"
+                                );
+                                continue;
+                            }
+                            // Byte-exact raw emission BEFORE the typed parse:
+                            // a typed-parse failure must never suppress the
+                            // raw frame.
+                            _ = raw_tx.send(RawWsEvent::Frame(RawWsFrame {
+                                json: Arc::from(text.as_str()),
+                                received_at: Instant::now(),
+                            }));
 
                             // Parse messages using the provided parser
                             match parser.parse(text.as_bytes()) {
@@ -413,6 +482,18 @@ where
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<M> {
         self.broadcast_tx.subscribe()
+    }
+
+    /// Subscribe to the raw pre-parse frame channel.
+    ///
+    /// Each call returns a new independent receiver of [`RawWsEvent`]. Frames
+    /// are emitted byte-exact BEFORE the typed parser runs, so consumers see
+    /// every data frame the connection received — including frames the typed
+    /// layer fails to parse. Transport control frames (PING/PONG/close) and
+    /// binary frames are never emitted here.
+    #[must_use]
+    pub fn subscribe_raw(&self) -> broadcast::Receiver<RawWsEvent> {
+        self.raw_tx.subscribe()
     }
 
     /// Subscribe to connection state changes.

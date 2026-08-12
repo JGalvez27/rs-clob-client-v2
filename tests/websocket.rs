@@ -1769,3 +1769,171 @@ mod message_parsing {
         assert_eq!(ltp.timestamp, 1_750_428_146_322);
     }
 }
+
+mod user_raw {
+    use polymarket_client_sdk_v2::auth::Credentials;
+    use polymarket_client_sdk_v2::clob::ws::WsError;
+    use tokio::time::sleep;
+
+    use super::*;
+    use crate::common::{API_KEY, PASSPHRASE, SECRET};
+
+    fn test_credentials() -> Credentials {
+        Credentials::new(API_KEY, SECRET.to_owned(), PASSPHRASE.to_owned())
+    }
+
+    async fn raw_client(
+        server: &MockWsServer,
+        config: Config,
+    ) -> polymarket_client_sdk_v2::clob::ws::Client<
+        polymarket_client_sdk_v2::auth::state::Authenticated<
+            polymarket_client_sdk_v2::auth::Normal,
+        >,
+    > {
+        let base_endpoint = format!("ws://{}", server.addr);
+        let client = Client::new(&base_endpoint, config)
+            .unwrap()
+            .authenticate(test_credentials(), Address::ZERO)
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        client
+    }
+
+    #[tokio::test]
+    async fn raw_frame_is_byte_exact_and_pre_parse() {
+        let mut server = MockWsServer::start().await;
+        let client = raw_client(&server, Config::default()).await;
+
+        let stream = client.subscribe_user_raw(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+        let sub_request = server.recv_subscription().await.unwrap();
+        assert!(sub_request.contains("\"type\":\"user\""));
+
+        // Odd whitespace + unknown fields + unknown status: the typed layer
+        // does not fully understand this frame; raw must be byte-exact anyway.
+        let wire = "{ \"event_type\":\"trade\", \"status\": \"MATCHED_NOT_BROADCASTED\",\n  \"mystery_field\": [1,2,3] }";
+        server.send(wire);
+
+        let frame = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*frame.json, wire, "raw frame must be byte-exact");
+    }
+
+    #[tokio::test]
+    async fn typed_parse_failure_still_yields_raw_frame() {
+        let mut server = MockWsServer::start().await;
+        let client = raw_client(&server, Config::default()).await;
+
+        let stream = client.subscribe_user_raw(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+        drop(server.recv_subscription().await.unwrap());
+
+        // Malformed JSON: the typed parser fails; the raw tap must not.
+        let wire = "{\"event_type\": \"trade\", \"price\": }";
+        server.send(wire);
+
+        let frame = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*frame.json, wire);
+    }
+
+    #[tokio::test]
+    async fn array_frame_is_one_raw_frame() {
+        let mut server = MockWsServer::start().await;
+        let client = raw_client(&server, Config::default()).await;
+
+        let stream = client.subscribe_user_raw(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+        drop(server.recv_subscription().await.unwrap());
+
+        let wire = format!("[{},{}]", payloads::trade(), payloads::order());
+        server.send(&wire);
+        // A sentinel frame proves no second raw frame came from the array.
+        server.send("{\"event_type\":\"sentinel\"}");
+
+        let first = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*first.json, &wire, "array frame arrives as ONE raw frame");
+        let second = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*second.json, "{\"event_type\":\"sentinel\"}");
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_error_item_and_stream_continues() {
+        let mut server = MockWsServer::start().await;
+        let mut config = Config::default();
+        config.max_frame_bytes = Some(64);
+        let client = raw_client(&server, config).await;
+
+        let stream = client.subscribe_user_raw(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+        drop(server.recv_subscription().await.unwrap());
+
+        let big = format!(
+            "{{\"event_type\":\"trade\",\"pad\":\"{}\"}}",
+            "x".repeat(100)
+        );
+        server.send(&big);
+        let small = "{\"event_type\":\"ok\"}";
+        server.send(small);
+
+        let first = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let err = first.expect_err("oversized frame must be an error item");
+        let inner = err.inner().expect("source present");
+        let ws = inner.downcast_ref::<WsError>().expect("WsError source");
+        assert!(
+            matches!(ws, WsError::FrameOversized { len, max } if *len == big.len() && *max == 64),
+            "got {ws:?}"
+        );
+
+        let second = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &*second.json, small,
+            "stream continues after the error item"
+        );
+    }
+
+    #[tokio::test]
+    async fn pong_and_binary_frames_never_reach_raw() {
+        let mut server = MockWsServer::start().await;
+        let client = raw_client(&server, Config::default()).await;
+
+        let stream = client.subscribe_user_raw(vec![]).unwrap();
+        let mut stream = Box::pin(stream);
+        drop(server.recv_subscription().await.unwrap());
+
+        server.send("PONG");
+        let marker = "{\"event_type\":\"marker\"}";
+        server.send(marker);
+
+        let first = timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &*first.json, marker,
+            "PONG must not appear on the raw stream"
+        );
+    }
+}

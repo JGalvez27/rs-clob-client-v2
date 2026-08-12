@@ -84,6 +84,19 @@ pub struct BookUpdate {
     pub asks: Vec<OrderBookLevel>,
     /// Hash for orderbook validation
     pub hash: Option<String>,
+    /// Last trade price embedded in the snapshot (decimal as string on the wire).
+    ///
+    /// Polymarket includes the most recent trade price as a per-snapshot field.
+    /// May be absent on partial book updates or markets without prior trades.
+    #[serde(default)]
+    pub last_trade_price: Option<Decimal>,
+    /// Current tick size (minimum price increment) for this market.
+    ///
+    /// Polymarket adjusts tick size dynamically per market (e.g. 0.01 → 0.001
+    /// when a market approaches edges). Captured here for client-side
+    /// quantization and cache invalidation.
+    #[serde(default)]
+    pub tick_size: Option<Decimal>,
 }
 
 /// Individual price level in an orderbook.
@@ -169,6 +182,14 @@ pub struct LastTradePrice {
     pub size: Option<Decimal>,
     /// Fee rate in basis points
     pub fee_rate_bps: Option<Decimal>,
+    /// On-chain transaction hash for the trade.
+    ///
+    /// Polymarket emits `last_trade_price` events with this field populated
+    /// after the matching engine settles the fill on-chain. May be absent or
+    /// empty for very early ticks before settlement.
+    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(default)]
+    pub transaction_hash: Option<B256>,
     /// Unix timestamp in milliseconds
     #[serde_as(as = "DisplayFromStr")]
     pub timestamp: i64,

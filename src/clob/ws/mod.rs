@@ -19,3 +19,7 @@ pub use types::response::{
 };
 
 pub use crate::ws::WsError;
+pub use crate::ws::connection::RawWsEvent;
+/// One raw user-channel frame, byte-exact, pre-parse (alias of the generic
+/// connection-layer type — the user channel is its first consumer).
+pub use crate::ws::connection::RawWsFrame as RawUserFrame;
