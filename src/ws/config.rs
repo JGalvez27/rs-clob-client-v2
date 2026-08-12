@@ -23,6 +23,15 @@ pub struct Config {
     pub heartbeat_timeout: Duration,
     /// Reconnection strategy configuration
     pub reconnect: ReconnectConfig,
+    /// Maximum accepted size (bytes) of a single incoming text frame.
+    ///
+    /// `None` (default) imposes no limit. When set, an oversized frame is
+    /// surfaced on the raw-frame channel as [`RawWsEvent::Oversized`]
+    /// (never truncated, never silently skipped) and is NOT passed to the
+    /// typed parser — a frame too large to journal must not be acted on.
+    ///
+    /// [`RawWsEvent::Oversized`]: crate::ws::connection::RawWsEvent::Oversized
+    pub max_frame_bytes: Option<usize>,
 }
 
 impl Default for Config {
@@ -31,6 +40,7 @@ impl Default for Config {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL_DURATION,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT_DURATION,
             reconnect: ReconnectConfig::default(),
+            max_frame_bytes: None,
         }
     }
 }

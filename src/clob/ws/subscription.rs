@@ -11,6 +11,7 @@ use std::time::Instant;
 use async_stream::try_stream;
 use dashmap::{DashMap, Entry};
 use futures::Stream;
+use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 use super::interest::{InterestTracker, MessageInterest};
@@ -22,6 +23,7 @@ use crate::types::{B256, U256};
 use crate::ws::ConnectionManager;
 use crate::ws::WsError;
 use crate::ws::connection::ConnectionState;
+use crate::ws::connection::RawWsEvent;
 
 /// What a subscription is targeting.
 #[non_exhaustive]
@@ -412,6 +414,15 @@ impl SubscriptionManager {
                 }
             }
         })
+    }
+
+    /// Subscribe to the connection's raw pre-parse frame channel
+    /// (see [`ConnectionManager::subscribe_raw`]).
+    ///
+    /// [`ConnectionManager::subscribe_raw`]: crate::ws::connection::ConnectionManager::subscribe_raw
+    #[must_use]
+    pub fn subscribe_raw_frames(&self) -> broadcast::Receiver<RawWsEvent> {
+        self.connection.subscribe_raw()
     }
 
     /// Get information about all active subscriptions.

@@ -16,10 +16,13 @@ use crate::Result;
 use crate::auth::state::{Authenticated, State, Unauthenticated};
 use crate::auth::{Credentials, Kind as AuthKind, Normal};
 use crate::error::Error;
+use crate::error::Kind;
 use crate::types::{Address, B256, Decimal, U256};
 use crate::ws::ConnectionManager;
+use crate::ws::WsError;
 use crate::ws::config::Config;
-use crate::ws::connection::ConnectionState;
+use crate::ws::connection::{ConnectionState, RawWsEvent, RawWsFrame as RawUserFrame};
+use tokio::sync::broadcast::error::RecvError;
 
 /// WebSocket client for real-time market data and user updates.
 ///
@@ -485,6 +488,73 @@ impl<K: AuthKind> Client<Authenticated<K>> {
         resources
             .subscriptions
             .subscribe_user(markets, &self.inner.state.credentials)
+    }
+
+    /// Subscribes to the raw user-channel frame stream: every incoming text
+    /// frame on the user WebSocket, byte-exact, BEFORE any typed parse.
+    ///
+    /// Semantics (all load-bearing for capture-first consumers):
+    /// - A frame is yielded even when the typed layer cannot parse it — an
+    ///   unknown event type, status, or field shape still arrives here.
+    /// - The receiver is attached BEFORE the subscribe request is sent, so no
+    ///   frame between request send and stream readiness can be missed.
+    /// - Broadcast lag is surfaced as an ERROR ITEM
+    ///   ([`WsError::StreamLagged`]) and the stream then continues — data
+    ///   loss is never a warning-only skip.
+    /// - A frame exceeding [`Config::max_frame_bytes`] arrives as an ERROR
+    ///   ITEM ([`WsError::FrameOversized`]); its payload is not truncated and
+    ///   is not parsed.
+    /// - Transport control frames (PING/PONG/close) and binary frames are
+    ///   never yielded.
+    ///
+    /// The subscription side-effect (interest registration, auth request,
+    /// market refcounts, reconnect re-subscription) is identical to
+    /// [`Self::subscribe_user_events`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created, the WebSocket
+    /// connection is not established, or authentication fails.
+    ///
+    /// [`Config::max_frame_bytes`]: crate::ws::config::Config::max_frame_bytes
+    pub fn subscribe_user_raw(
+        &self,
+        markets: Vec<B256>,
+    ) -> Result<impl Stream<Item = Result<RawUserFrame>> + use<K>> {
+        let resources = self.inner.get_or_create_channel(ChannelType::User)?;
+
+        // Attach the raw receiver BEFORE sending the subscribe request so no
+        // frame between the request and stream readiness can be missed.
+        let mut rx = resources.subscriptions.subscribe_raw_frames();
+
+        // Drive the registration side-effect; the typed stream is dropped —
+        // the raw channel is this subscriber's delivery path.
+        drop(
+            resources
+                .subscriptions
+                .subscribe_user(markets, &self.inner.state.credentials)?,
+        );
+
+        Ok(async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(RawWsEvent::Frame(frame)) => yield Ok(frame),
+                    Ok(RawWsEvent::Oversized { len, max }) => {
+                        yield Err(Error::with_source(
+                            Kind::WebSocket,
+                            WsError::FrameOversized { len, max },
+                        ));
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        yield Err(Error::with_source(
+                            Kind::WebSocket,
+                            WsError::StreamLagged(n),
+                        ));
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        })
     }
 
     /// Subscribes to real-time order status updates for the authenticated user.
