@@ -15,6 +15,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{interval, sleep, timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+#[cfg(feature = "tracing")]
+use tracing::Instrument as _;
 
 use super::config::Config;
 use super::error::WsError;
@@ -100,6 +102,9 @@ where
     sender_tx: mpsc::UnboundedSender<String>,
     /// Broadcast sender for incoming messages
     broadcast_tx: broadcast::Sender<M>,
+    /// Span carrying endpoint and current subscription context.
+    #[cfg(feature = "tracing")]
+    pub(crate) span: tracing::Span,
     /// Phantom data for unused type parameters
     _phantom: PhantomData<P>,
 }
@@ -118,6 +123,13 @@ where
         let (sender_tx, sender_rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+        #[cfg(feature = "tracing")]
+        let span = tracing::info_span!(
+            "websocket_connection",
+            endpoint = %endpoint,
+            subscribed_asset_ids = tracing::field::Empty,
+            subscribed_market_ids = tracing::field::Empty,
+        );
 
         // Spawn connection task
         let connection_config = config;
@@ -125,23 +137,25 @@ where
         let broadcast_tx_clone = broadcast_tx.clone();
         let state_tx_clone = state_tx.clone();
 
-        tokio::spawn(async move {
-            Self::connection_loop(
-                connection_endpoint,
-                connection_config,
-                sender_rx,
-                broadcast_tx_clone,
-                parser,
-                state_tx_clone,
-            )
-            .await;
-        });
+        let connection_task = Self::connection_loop(
+            connection_endpoint,
+            connection_config,
+            sender_rx,
+            broadcast_tx_clone,
+            parser,
+            state_tx_clone,
+        );
+        #[cfg(feature = "tracing")]
+        let connection_task = connection_task.instrument(span.clone());
+        tokio::spawn(connection_task);
 
         Ok(Self {
             state_tx,
             state_rx,
             sender_tx,
             broadcast_tx,
+            #[cfg(feature = "tracing")]
+            span,
             _phantom: PhantomData,
         })
     }
@@ -180,19 +194,28 @@ where
                         since: Instant::now(),
                     });
 
-                    // Handle connection
-                    if let Err(e) = Self::handle_connection(
+                    #[cfg(feature = "tracing")]
+                    let established_span = tracing::info_span!(
+                        "websocket_connection_established",
+                        close_code = tracing::field::Empty,
+                        close_reason = tracing::field::Empty,
+                    );
+                    let handler = Self::handle_connection(
                         ws_stream,
                         &mut sender_rx,
                         &broadcast_tx,
                         state_rx,
                         config.clone(),
                         &parser,
-                    )
-                    .await
-                    {
+                    );
+                    #[cfg(feature = "tracing")]
+                    let handler = handler.instrument(established_span.clone());
+                    if let Err(e) = handler.await {
                         #[cfg(feature = "tracing")]
-                        tracing::error!("Error handling connection: {e:?}");
+                        tracing::error!(
+                            parent: &established_span,
+                            "Error handling connection: {e:?}"
+                        );
                         #[cfg(not(feature = "tracing"))]
                         let _: &_ = &e;
                     }
@@ -239,9 +262,12 @@ where
         let (pong_tx, pong_rx) = watch::channel(Instant::now());
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
 
-        let heartbeat_handle = tokio::spawn(async move {
+        let heartbeat_task = async move {
             Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
-        });
+        };
+        #[cfg(feature = "tracing")]
+        let heartbeat_task = heartbeat_task.in_current_span();
+        let heartbeat_handle = tokio::spawn(heartbeat_task);
 
         loop {
             tokio::select! {
@@ -272,7 +298,20 @@ where
                                 }
                             }
                         }
-                        Ok(Message::Close(_)) => {
+                        Ok(Message::Close(frame)) => {
+                            #[cfg(feature = "tracing")]
+                            {
+                                let span = tracing::Span::current();
+                                if let Some(frame) = frame {
+                                    span.record("close_code", u16::from(frame.code));
+                                    span.record("close_reason", tracing::field::display(&frame.reason));
+                                } else {
+                                    span.record("close_code", "absent");
+                                    span.record("close_reason", "absent");
+                                }
+                            }
+                            #[cfg(not(feature = "tracing"))]
+                            let _ = &frame;
                             heartbeat_handle.abort();
                             return Err(Error::with_source(
                                 Kind::WebSocket,

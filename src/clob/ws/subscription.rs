@@ -12,6 +12,8 @@ use async_stream::try_stream;
 use dashmap::{DashMap, Entry};
 use futures::Stream;
 use tokio::sync::broadcast::error::RecvError;
+#[cfg(feature = "tracing")]
+use tracing::Instrument as _;
 
 use super::interest::{InterestTracker, MessageInterest};
 use super::types::request::SubscriptionRequest;
@@ -108,7 +110,9 @@ impl SubscriptionManager {
     pub fn start_reconnection_handler(self: &Arc<Self>) {
         let this = Arc::clone(self);
 
-        tokio::spawn(async move {
+        #[cfg(feature = "tracing")]
+        let span = this.connection.span.clone();
+        let handler = async move {
             let mut state_rx = this.connection.state_receiver();
             let mut was_connected = state_rx.borrow().is_connected();
 
@@ -126,7 +130,9 @@ impl SubscriptionManager {
                         if was_connected {
                             // Reconnect to subscriptions
                             #[cfg(feature = "tracing")]
-                            tracing::debug!("WebSocket reconnected, re-establishing subscriptions");
+                            tracing::debug!(
+                                "WebSocket reconnected, queueing current subscriptions"
+                            );
                             this.resubscribe_all();
                         }
                         was_connected = true;
@@ -140,7 +146,12 @@ impl SubscriptionManager {
                     }
                 }
             }
-        });
+        };
+
+        #[cfg(feature = "tracing")]
+        tokio::spawn(handler.instrument(span));
+        #[cfg(not(feature = "tracing"))]
+        tokio::spawn(handler);
     }
 
     /// Re-send subscription requests for all tracked assets and markets.
@@ -154,7 +165,7 @@ impl SubscriptionManager {
             tracing::debug!(
                 count = assets.len(),
                 custom_features,
-                "Re-subscribing to market assets"
+                "Queueing market asset re-subscription"
             );
             let mut request = SubscriptionRequest::market(assets);
             if custom_features {
@@ -181,7 +192,7 @@ impl SubscriptionManager {
             #[cfg(feature = "tracing")]
             tracing::debug!(
                 markets_count = markets.len(),
-                "Re-subscribing to user channel"
+                "Queueing user channel re-subscription"
             );
             let request = SubscriptionRequest::user(markets);
             if let Err(e) = self.connection.send_authenticated(&request, &auth) {
@@ -191,6 +202,32 @@ impl SubscriptionManager {
                 let _ = &e;
             }
         }
+    }
+    #[cfg(feature = "tracing")]
+    fn record_subscription_context(&self) {
+        if self.connection.span.is_disabled() {
+            return;
+        }
+        let mut asset_ids: Vec<String> = self
+            .subscribed_assets
+            .iter()
+            .map(|entry| entry.key().to_string())
+            .collect();
+        asset_ids.sort_unstable();
+
+        let mut market_ids: Vec<String> = self
+            .subscribed_markets
+            .iter()
+            .map(|entry| entry.key().to_string())
+            .collect();
+        market_ids.sort_unstable();
+
+        self.connection
+            .span
+            .record("subscribed_asset_ids", tracing::field::debug(&asset_ids));
+        self.connection
+            .span
+            .record("subscribed_market_ids", tracing::field::debug(&market_ids));
     }
 
     /// Subscribe to public market data channel.
@@ -243,6 +280,8 @@ impl SubscriptionManager {
                 }
             })
             .collect();
+        #[cfg(feature = "tracing")]
+        self.record_subscription_context();
 
         // Only send subscription request for new assets
         if new_assets.is_empty() {
@@ -356,6 +395,8 @@ impl SubscriptionManager {
                 }
             })
             .collect();
+        #[cfg(feature = "tracing")]
+        self.record_subscription_context();
 
         // Only send subscription request for new markets (or if subscribing to all)
         if !markets.is_empty() && new_markets.is_empty() {
@@ -470,6 +511,8 @@ impl SubscriptionManager {
                 }
             }
         }
+        #[cfg(feature = "tracing")]
+        self.record_subscription_context();
 
         // Send unsubscribe only for zero-refcount assets
         if !to_unsubscribe.is_empty() {
@@ -526,6 +569,8 @@ impl SubscriptionManager {
                 }
             }
         }
+        #[cfg(feature = "tracing")]
+        self.record_subscription_context();
 
         // Send unsubscribe only for zero-refcount markets
         if !to_unsubscribe.is_empty() {

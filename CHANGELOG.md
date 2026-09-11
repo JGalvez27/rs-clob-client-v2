@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(clob::ws)* preserve book snapshots with an empty optional last-trade price.
+- *(ws)* retain caller context, endpoint, active subscriptions, and peer close code/reason in connection diagnostics.
+
 ## [0.4.4](https://github.com/Polymarket/rs-clob-client/compare/v0.4.3...v0.4.4) - 2026-03-17
 
 ### Fixed
