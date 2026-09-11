@@ -1,7 +1,7 @@
 use bon::Builder;
 use serde::Deserialize;
 use serde_json::Value;
-use serde_with::{DefaultOnNull, DisplayFromStr, NoneAsEmptyString, serde_as};
+use serde_with::{DefaultOnNull, DisplayFromStr, NoneAsEmptyString, PickFirst, serde_as};
 #[cfg(feature = "tracing")]
 use tracing::warn;
 
@@ -87,8 +87,9 @@ pub struct BookUpdate {
     /// Last trade price embedded in the snapshot (decimal as string on the wire).
     ///
     /// Polymarket includes the most recent trade price as a per-snapshot field.
-    /// May be absent on partial book updates or markets without prior trades.
+    /// May be absent or an empty string on markets without prior trades.
     #[serde(default)]
+    #[serde_as(as = "PickFirst<(Option<_>, NoneAsEmptyString)>")]
     pub last_trade_price: Option<Decimal>,
     /// Current tick size (minimum price increment) for this market.
     ///
@@ -551,6 +552,8 @@ pub fn parse_if_interested(
                         #[cfg(feature = "tracing")]
                         warn!(
                             event_type = %event_type,
+                            asset_id = ?obj.get("asset_id").and_then(|value| value.as_str()),
+                            market = ?obj.get("market").and_then(|value| value.as_str()),
                             error = %err,
                             "Skipping unknown/invalid WS event in batch"
                         );
@@ -610,6 +613,31 @@ mod tests {
             }
             _ => panic!("Expected Book message"),
         }
+    }
+
+    #[test]
+    fn parse_book_batch_with_empty_last_trade_price() {
+        // Minimized from an untraded SOL successor market's live book frame.
+        let json = br#"[{
+            "event_type": "book",
+            "asset_id": "7757814383686633416798100993525517928494461796228786637853450850307664124344",
+            "market": "0xd8fa5fb27d9c663c9ad23f29cee3918790dffd306baa6d24f0560e4b422eb528",
+            "timestamp": "1789164115422",
+            "bids": [{"price": "0.01", "size": "56641.01"}],
+            "asks": [{"price": "0.99", "size": "59641.01"}],
+            "last_trade_price": "",
+            "tick_size": "0.01"
+        }]"#;
+
+        let messages = parse_if_interested(json, &MessageInterest::BOOK).unwrap();
+        let [WsMessage::Book(book)] = messages.as_slice() else {
+            panic!("the book was discarded because its last trade price is unavailable");
+        };
+        assert!(book.last_trade_price.is_none());
+        assert_eq!(book.bids[0].price, dec!(0.01));
+        assert_eq!(book.bids[0].size, dec!(56641.01));
+        assert_eq!(book.asks[0].price, dec!(0.99));
+        assert_eq!(book.asks[0].size, dec!(59641.01));
     }
 
     #[test]
