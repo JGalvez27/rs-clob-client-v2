@@ -62,6 +62,25 @@ Then run any of the examples
 cargo run --example unauthenticated
 ```
 
+### TLS provider
+
+This fork uses Rustls with Ring instead of AWS-LC. SDK HTTP and WebSocket clients
+install Ring when no process-wide crypto provider has been selected; an existing
+provider is left unchanged. Certificate verification, system roots, and HTTP
+proxy support remain enabled.
+
+CTF accepts a caller-owned Alloy provider. Before creating that provider, select
+a Rustls crypto provider explicitly:
+
+```rust
+let _ = rustls::crypto::ring::default_provider().install_default();
+```
+
+For caller-owned providers, add `rustls = { version = "0.23", default-features = false,
+features = ["ring", "std", "tls12"] }` to your dependencies and use Alloy's `reqwest`
+feature rather than `reqwest-rustls-tls`. Other dependencies that explicitly enable
+AWS-LC can still bring it into your build.
+
 ## Feature Flags
 
 The crate is modular with optional features for different Polymarket APIs:

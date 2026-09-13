@@ -69,6 +69,8 @@ sol! {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     if let Ok(path) = env::var("LOG_FILE") {
         let file = File::create(path)?;
         tracing_subscriber::registry()

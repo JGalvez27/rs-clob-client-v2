@@ -246,6 +246,20 @@ impl<T: Serialize> ToQueryParams for T {}
     feature = "data",
     feature = "gamma"
 ))]
+fn http_client_builder() -> reqwest::ClientBuilder {
+    // Provider-free Reqwest needs a crypto provider before client construction.
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    reqwest::Client::builder()
+}
+
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(

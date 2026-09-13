@@ -23,6 +23,7 @@
 //! use alloy::primitives::{B256, U256};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let _ = rustls::crypto::ring::default_provider().install_default();
 //! // Create a provider (requires a wallet for state-changing operations)
 //! let provider = ProviderBuilder::new()
 //!     .connect("https://polygon-rpc.com")

@@ -93,7 +93,9 @@ impl Client {
         headers.insert("Accept", HeaderValue::from_static("*/*"));
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        let client = crate::http_client_builder()
+            .default_headers(headers)
+            .build()?;
 
         Ok(Self {
             host: Url::parse(host)?,

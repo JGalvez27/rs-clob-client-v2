@@ -16,6 +16,7 @@
 //! use alloy::providers::ProviderBuilder;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let _ = rustls::crypto::ring::default_provider().install_default();
 //! let provider = ProviderBuilder::new()
 //!     .connect("https://polygon-rpc.com")
 //!     .await?;
