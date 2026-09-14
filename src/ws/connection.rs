@@ -18,7 +18,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 #[cfg(feature = "tracing")]
 use tracing::Instrument as _;
 
-use super::config::Config;
+use super::config::{Config, WebSocketObservation};
 use super::error::WsError;
 use super::traits::MessageParser;
 use crate::auth::Credentials;
@@ -102,6 +102,8 @@ where
     sender_tx: mpsc::UnboundedSender<String>,
     /// Broadcast sender for incoming messages
     broadcast_tx: broadcast::Sender<M>,
+    /// Observer copied into subscription streams that report receiver lag.
+    pub(crate) observer: Option<fn(WebSocketObservation)>,
     /// Span carrying endpoint and current subscription context.
     #[cfg(feature = "tracing")]
     pub(crate) span: tracing::Span,
@@ -130,6 +132,7 @@ where
             subscribed_asset_ids = tracing::field::Empty,
             subscribed_market_ids = tracing::field::Empty,
         );
+        let observer = config.observer;
 
         // Spawn connection task
         let connection_config = config;
@@ -154,6 +157,7 @@ where
             state_rx,
             sender_tx,
             broadcast_tx,
+            observer,
             #[cfg(feature = "tracing")]
             span,
             _phantom: PhantomData,
@@ -171,6 +175,7 @@ where
     ) {
         let mut attempt = 0_u32;
         let mut backoff: backoff::ExponentialBackoff = config.reconnect.clone().into();
+        let mut reconnect_started: Option<Instant> = None;
 
         loop {
             // Check if ConnectionManager was dropped (all sender_tx instances gone)
@@ -188,6 +193,13 @@ where
             // Attempt connection
             match connect_async(&endpoint).await {
                 Ok((ws_stream, _)) => {
+                    if let Some(observer) = config.observer {
+                        observer(WebSocketObservation::Connected {
+                            reconnect_duration: reconnect_started
+                                .take()
+                                .map(|start| start.elapsed()),
+                        });
+                    }
                     attempt = 0;
                     backoff.reset();
                     _ = state_tx.send(ConnectionState::Connected {
@@ -210,7 +222,12 @@ where
                     );
                     #[cfg(feature = "tracing")]
                     let handler = handler.instrument(established_span.clone());
-                    if let Err(e) = handler.await {
+                    let result = handler.await;
+                    if let Some(observer) = config.observer {
+                        reconnect_started = Some(Instant::now());
+                        observer(WebSocketObservation::Disconnected);
+                    }
+                    if let Err(e) = result {
                         #[cfg(feature = "tracing")]
                         tracing::error!(
                             parent: &established_span,
@@ -261,6 +278,7 @@ where
         // Channel to notify heartbeat loop when PONG is received
         let (pong_tx, pong_rx) = watch::channel(Instant::now());
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
+        let observer = config.observer;
 
         let heartbeat_task = async move {
             Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
@@ -278,11 +296,27 @@ where
                             _ = pong_tx.send(Instant::now());
                         }
                         Ok(Message::Text(text)) => {
+                            if let Some(observer) = observer {
+                                observer(WebSocketObservation::TextMessage { bytes: text.len() });
+                            }
                             #[cfg(feature = "tracing")]
                             tracing::trace!(%text, "Received WebSocket text message");
 
-                            // Parse messages using the provided parser
-                            match parser.parse(text.as_bytes()) {
+                            let parsed = if let Some(observer) = observer {
+                                let started = Instant::now();
+                                let parsed = parser.parse(text.as_bytes());
+                                let duration = started.elapsed();
+                                observer(WebSocketObservation::Decoded {
+                                    duration,
+                                    messages: parsed.as_ref().map_or(0, Vec::len),
+                                    failed: parsed.is_err(),
+                                });
+                                parsed
+                            } else {
+                                parser.parse(text.as_bytes())
+                            };
+
+                            match parsed {
                                 Ok(messages) => {
                                     for message in messages {
                                         #[cfg(feature = "tracing")]
@@ -299,6 +333,11 @@ where
                             }
                         }
                         Ok(Message::Close(frame)) => {
+                            if let Some(observer) = observer {
+                                observer(WebSocketObservation::CloseFrame {
+                                    code: frame.as_ref().map(|frame| u16::from(frame.code)),
+                                });
+                            }
                             #[cfg(feature = "tracing")]
                             {
                                 let span = tracing::Span::current();

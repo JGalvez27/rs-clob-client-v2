@@ -13,6 +13,45 @@ const DEFAULT_INITIAL_BACKOFF_DURATION: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF_DURATION: Duration = Duration::from_secs(60);
 const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
 
+/// A synchronous observation from the WebSocket transport.
+///
+/// Observer callbacks must not panic or block.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum WebSocketObservation {
+    /// A WebSocket handshake completed.
+    Connected {
+        /// Time since the previous established connection ended, or `None` for the first connection.
+        reconnect_duration: Option<Duration>,
+    },
+    /// An established WebSocket connection ended.
+    Disconnected,
+    /// A close frame was received from the peer.
+    CloseFrame {
+        /// The close code, when the frame included one.
+        code: Option<u16>,
+    },
+    /// A non-PONG text message was received.
+    TextMessage {
+        /// UTF-8 payload length, excluding WebSocket and TLS headers.
+        bytes: usize,
+    },
+    /// A text message was decoded.
+    Decoded {
+        /// Time spent in the parser.
+        duration: Duration,
+        /// Number of messages returned by the parser, or zero on error.
+        messages: usize,
+        /// Whether parsing failed.
+        failed: bool,
+    },
+    /// A subscription receiver skipped broadcast deliveries because it lagged.
+    ReceiverLagged {
+        /// Number of skipped broadcast deliveries.
+        messages: u64,
+    },
+}
+
 /// Configuration for WebSocket client behavior.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -23,6 +62,10 @@ pub struct Config {
     pub heartbeat_timeout: Duration,
     /// Reconnection strategy configuration
     pub reconnect: ReconnectConfig,
+    /// Optional synchronous observer for WebSocket transport measurements.
+    ///
+    /// The callback runs inline and must not panic or block.
+    pub observer: Option<fn(WebSocketObservation)>,
 }
 
 impl Default for Config {
@@ -31,6 +74,7 @@ impl Default for Config {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL_DURATION,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT_DURATION,
             reconnect: ReconnectConfig::default(),
+            observer: None,
         }
     }
 }

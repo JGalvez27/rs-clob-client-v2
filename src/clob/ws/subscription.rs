@@ -23,6 +23,7 @@ use crate::auth::Credentials;
 use crate::types::{B256, U256};
 use crate::ws::ConnectionManager;
 use crate::ws::WsError;
+use crate::ws::config::WebSocketObservation;
 use crate::ws::connection::ConnectionState;
 
 /// What a subscription is targeting.
@@ -322,6 +323,7 @@ impl SubscriptionManager {
         // Create filtered stream with its own receiver
         let mut rx = self.connection.subscribe();
         let asset_ids_set: HashSet<U256> = asset_ids.into_iter().collect();
+        let observer = self.connection.observer;
 
         Ok(try_stream! {
             loop {
@@ -353,8 +355,9 @@ impl SubscriptionManager {
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
+                        if let Some(observer) = observer {
+                            observer(WebSocketObservation::ReceiverLagged { messages: n });
+                        }
                         #[cfg(feature = "tracing")]
                         tracing::warn!("Subscription lagged, missed {n} messages — continuing");
                     }
@@ -432,6 +435,7 @@ impl SubscriptionManager {
 
         // Create stream for user messages
         let mut rx = self.connection.subscribe();
+        let observer = self.connection.observer;
 
         Ok(try_stream! {
             loop {
@@ -442,8 +446,9 @@ impl SubscriptionManager {
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
+                        if let Some(observer) = observer {
+                            observer(WebSocketObservation::ReceiverLagged { messages: n });
+                        }
                         #[cfg(feature = "tracing")]
                         tracing::warn!("Subscription lagged, missed {n} messages — continuing");
                     }
