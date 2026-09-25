@@ -902,9 +902,10 @@ pub struct RfqQuote {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
+
+    use super::*;
 
     // Regression: a 0.0025 quarter-cent tick size must not fail `/book`
     // deserialization. Before forward-compatible `TickSize` handling, an
