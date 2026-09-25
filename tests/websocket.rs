@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use polymarket_client_sdk_v2::clob::ws::{Client, WsMessage};
+use polymarket_client_sdk_v2::clob::ws::{Client, MarketStreamItem, WsMessage};
 use polymarket_client_sdk_v2::types::{Address, U256, b256};
 use polymarket_client_sdk_v2::ws::config::Config;
 use serde_json::json;
@@ -28,6 +28,8 @@ struct MockWsServer {
     message_tx: broadcast::Sender<String>,
     /// Receives subscription requests from clients
     subscription_rx: mpsc::UnboundedReceiver<String>,
+    /// Reports when a connected peer observes the socket close.
+    connection_closed_rx: mpsc::UnboundedReceiver<()>,
 }
 
 impl MockWsServer {
@@ -39,6 +41,7 @@ impl MockWsServer {
         // Broadcast channel for sending to ALL clients
         let (message_tx, _) = broadcast::channel::<String>(100);
         let (subscription_tx, subscription_rx) = mpsc::unbounded_channel::<String>();
+        let (connection_closed_tx, connection_closed_rx) = mpsc::unbounded_channel();
 
         let broadcast_tx = message_tx.clone();
 
@@ -55,34 +58,41 @@ impl MockWsServer {
                 let (mut write, mut read) = ws_stream.split();
                 let sub_tx = subscription_tx.clone();
                 let mut msg_rx = broadcast_tx.subscribe();
+                let closed_tx = connection_closed_tx.clone();
 
                 // Spawn a task to handle this connection
                 tokio::spawn(async move {
                     loop {
-                        tokio::select! {
-                            // Handle incoming messages from client
+                        let outgoing = tokio::select! {
                             msg = read.next() => {
                                 match msg {
-                                    Some(Ok(Message::Text(text))) if text != "PING" => {
-                                        drop(sub_tx.send(text.to_string()));
+                                    Some(Ok(Message::Text(text))) if text == "PING" => {
+                                        Some("PONG".to_owned())
                                     }
-                                    Some(Ok(_)) => {}
+                                    Some(Ok(Message::Text(text))) => {
+                                        drop(sub_tx.send(text.to_string()));
+                                        None
+                                    }
+                                    Some(Ok(_)) => None,
                                     _ => break,
                                 }
                             }
-                            // Handle outgoing messages to client
                             msg = msg_rx.recv() => {
                                 match msg {
-                                    Ok(text) => {
-                                        if write.send(Message::Text(text.into())).await.is_err() {
-                                            break;
-                                        }
-                                    }
+                                    Ok(text) => Some(text),
                                     Err(_) => break,
                                 }
                             }
+                        };
+
+                        if let Some(text) = outgoing
+                            && write.send(Message::Text(text.into())).await.is_err()
+                        {
+                            break;
                         }
                     }
+                    // Most tests do not retain the socket-close witness receiver.
+                    let _: Result<(), _> = closed_tx.send(());
                 });
             }
         });
@@ -91,6 +101,7 @@ impl MockWsServer {
             addr,
             message_tx,
             subscription_rx,
+            connection_closed_rx,
         }
     }
 
@@ -109,6 +120,11 @@ impl MockWsServer {
             .await
             .ok()
             .flatten()
+    }
+
+    /// Wait for a connected peer to observe its socket close.
+    async fn recv_connection_closed(&mut self) -> bool {
+        self.connection_closed_rx.recv().await.is_some()
     }
 }
 
@@ -456,6 +472,165 @@ mod market_channel {
         let result = timeout(Duration::from_secs(2), stream.next()).await;
         let midpoint = result.unwrap().unwrap().unwrap();
         assert_eq!(midpoint.midpoint, dec!(0.50));
+    }
+}
+
+mod raw_market_lifecycle {
+    use super::*;
+
+    fn assert_book(item: MarketStreamItem, expected_timestamp: i64) {
+        match item {
+            MarketStreamItem::Message(WsMessage::Book(book)) => {
+                assert_eq!(
+                    book.timestamp, expected_timestamp,
+                    "book belongs to the expected socket"
+                );
+            }
+            _ => panic!("expected raw book message"),
+        }
+    }
+
+    fn assert_tick_size_change(item: MarketStreamItem) {
+        match item {
+            MarketStreamItem::Message(WsMessage::TickSizeChange(change)) => {
+                assert_eq!(
+                    change.timestamp, 100_000_000,
+                    "queued change belongs to the old socket"
+                );
+            }
+            _ => panic!("expected raw tick-size-change message"),
+        }
+    }
+
+    fn assert_reconnected(item: &MarketStreamItem) {
+        assert!(
+            matches!(item, MarketStreamItem::Reconnected),
+            "expected the reconnect boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_last_client_and_raw_streams_closes_market_socket() {
+        let mut server = MockWsServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let first_stream = client
+            .subscribe_market_raw(vec![payloads::asset_id()], true)
+            .unwrap();
+        let second_stream = client
+            .subscribe_market_raw(vec![payloads::asset_id()], true)
+            .unwrap();
+        server.recv_subscription().await.unwrap();
+
+        drop(first_stream);
+        drop(second_stream);
+        drop(client);
+
+        assert!(
+            timeout(Duration::from_secs(1), server.recv_connection_closed())
+                .await
+                .unwrap(),
+            "peer did not observe the market socket close"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_reconnect_orders_raw_items_across_sockets() {
+        let mut server = MockWsServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+        let mut config = Config::default();
+        config.reconnect.initial_backoff = Duration::from_millis(10);
+        let client = Client::new(&endpoint, config).unwrap();
+
+        let first_stream = client
+            .subscribe_market_raw(vec![payloads::asset_id()], true)
+            .unwrap();
+        let second_stream = client
+            .subscribe_market_raw(vec![payloads::asset_id()], true)
+            .unwrap();
+        let mut first_stream = Box::pin(first_stream);
+        let mut second_stream = Box::pin(second_stream);
+        server.recv_subscription().await.unwrap();
+
+        server.send(&payloads::book().to_string());
+        assert_book(
+            timeout(Duration::from_secs(2), first_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            123_456_789_000,
+        );
+        assert_book(
+            timeout(Duration::from_secs(2), second_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            123_456_789_000,
+        );
+
+        server.send(&payloads::tick_size_change().to_string());
+        assert_tick_size_change(
+            timeout(Duration::from_secs(2), first_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+
+        client.reconnect_market();
+        assert!(
+            timeout(Duration::from_secs(2), server.recv_connection_closed())
+                .await
+                .unwrap(),
+            "peer did not observe the forced close"
+        );
+        let resubscription = server.recv_subscription().await.unwrap();
+        assert!(resubscription.contains(payloads::ASSET_ID_STR));
+        let mut new_book = payloads::book();
+        new_book["timestamp"] = json!("123456789001");
+        server.send(&new_book.to_string());
+
+        assert_reconnected(
+            &timeout(Duration::from_secs(2), first_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        assert_book(
+            timeout(Duration::from_secs(2), first_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            123_456_789_001,
+        );
+
+        assert_tick_size_change(
+            timeout(Duration::from_secs(2), second_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        assert_reconnected(
+            &timeout(Duration::from_secs(2), second_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        );
+        assert_book(
+            timeout(Duration::from_secs(2), second_stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            123_456_789_001,
+        );
     }
 }
 
