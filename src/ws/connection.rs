@@ -5,6 +5,7 @@
 
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Instant;
 
 use backoff::backoff::Backoff as _;
@@ -12,7 +13,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::time::{interval, sleep, timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 #[cfg(feature = "tracing")]
@@ -30,6 +31,12 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Broadcast channel capacity for incoming messages.
 const BROADCAST_CAPACITY: usize = 1024;
+
+#[derive(Debug, Clone)]
+pub(crate) enum ConnectionEvent<M> {
+    Message(M),
+    Reconnected,
+}
 
 /// Connection state tracking.
 #[non_exhaustive]
@@ -100,10 +107,12 @@ where
     state_rx: watch::Receiver<ConnectionState>,
     /// Sender channel for outgoing messages
     sender_tx: mpsc::UnboundedSender<String>,
-    /// Broadcast sender for incoming messages
-    broadcast_tx: broadcast::Sender<M>,
+    /// Broadcast sender for incoming messages and connection boundaries.
+    broadcast_tx: broadcast::Sender<ConnectionEvent<M>>,
+    /// Requests that the active socket close so the normal reconnect loop runs.
+    reconnect_notify: Arc<Notify>,
     /// Observer copied into subscription streams that report receiver lag.
-    pub(crate) observer: Option<fn(WebSocketObservation)>,
+    pub(crate) observer: Option<Arc<dyn Fn(WebSocketObservation) + Send + Sync>>,
     /// Span carrying endpoint and current subscription context.
     #[cfg(feature = "tracing")]
     pub(crate) span: tracing::Span,
@@ -125,6 +134,7 @@ where
         let (sender_tx, sender_rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+        let reconnect_notify = Arc::new(Notify::new());
         #[cfg(feature = "tracing")]
         let span = tracing::info_span!(
             "websocket_connection",
@@ -132,7 +142,7 @@ where
             subscribed_asset_ids = tracing::field::Empty,
             subscribed_market_ids = tracing::field::Empty,
         );
-        let observer = config.observer;
+        let observer = config.observer.clone();
 
         // Spawn connection task
         let connection_config = config;
@@ -147,6 +157,7 @@ where
             broadcast_tx_clone,
             parser,
             state_tx_clone,
+            Arc::clone(&reconnect_notify),
         );
         #[cfg(feature = "tracing")]
         let connection_task = connection_task.instrument(span.clone());
@@ -157,6 +168,7 @@ where
             state_rx,
             sender_tx,
             broadcast_tx,
+            reconnect_notify,
             observer,
             #[cfg(feature = "tracing")]
             span,
@@ -169,13 +181,15 @@ where
         endpoint: String,
         config: Config,
         mut sender_rx: mpsc::UnboundedReceiver<String>,
-        broadcast_tx: broadcast::Sender<M>,
+        broadcast_tx: broadcast::Sender<ConnectionEvent<M>>,
         parser: P,
         state_tx: watch::Sender<ConnectionState>,
+        reconnect_notify: Arc<Notify>,
     ) {
         let mut attempt = 0_u32;
         let mut backoff: backoff::ExponentialBackoff = config.reconnect.clone().into();
         let mut reconnect_started: Option<Instant> = None;
+        let mut connected_once = false;
 
         loop {
             // Check if ConnectionManager was dropped (all sender_tx instances gone)
@@ -193,13 +207,17 @@ where
             // Attempt connection
             match connect_async(&endpoint).await {
                 Ok((ws_stream, _)) => {
-                    if let Some(observer) = config.observer {
+                    if let Some(observer) = &config.observer {
                         observer(WebSocketObservation::Connected {
                             reconnect_duration: reconnect_started
                                 .take()
                                 .map(|start| start.elapsed()),
                         });
                     }
+                    if connected_once {
+                        _ = broadcast_tx.send(ConnectionEvent::Reconnected);
+                    }
+                    connected_once = true;
                     attempt = 0;
                     backoff.reset();
                     _ = state_tx.send(ConnectionState::Connected {
@@ -219,12 +237,13 @@ where
                         state_rx,
                         config.clone(),
                         &parser,
+                        &reconnect_notify,
                     );
                     #[cfg(feature = "tracing")]
                     let handler = handler.instrument(established_span.clone());
                     let result = handler.await;
-                    if let Some(observer) = config.observer {
-                        reconnect_started = Some(Instant::now());
+                    reconnect_started = Some(Instant::now());
+                    if let Some(observer) = &config.observer {
                         observer(WebSocketObservation::Disconnected);
                     }
                     if let Err(e) = result {
@@ -268,17 +287,18 @@ where
     async fn handle_connection(
         ws_stream: WsStream,
         sender_rx: &mut mpsc::UnboundedReceiver<String>,
-        broadcast_tx: &broadcast::Sender<M>,
+        broadcast_tx: &broadcast::Sender<ConnectionEvent<M>>,
         state_rx: watch::Receiver<ConnectionState>,
         config: Config,
         parser: &P,
+        reconnect_notify: &Notify,
     ) -> Result<()> {
         let (mut write, mut read) = ws_stream.split();
 
         // Channel to notify heartbeat loop when PONG is received
         let (pong_tx, pong_rx) = watch::channel(Instant::now());
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
-        let observer = config.observer;
+        let observer = config.observer.clone();
 
         let heartbeat_task = async move {
             Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
@@ -296,13 +316,13 @@ where
                             _ = pong_tx.send(Instant::now());
                         }
                         Ok(Message::Text(text)) => {
-                            if let Some(observer) = observer {
+                            if let Some(observer) = &observer {
                                 observer(WebSocketObservation::TextMessage { bytes: text.len() });
                             }
                             #[cfg(feature = "tracing")]
                             tracing::trace!(%text, "Received WebSocket text message");
 
-                            let parsed = if let Some(observer) = observer {
+                            let parsed = if let Some(observer) = &observer {
                                 let started = Instant::now();
                                 let parsed = parser.parse(text.as_bytes());
                                 let duration = started.elapsed();
@@ -321,7 +341,7 @@ where
                                     for message in messages {
                                         #[cfg(feature = "tracing")]
                                         tracing::trace!(?message, "Parsed WebSocket message");
-                                        _ = broadcast_tx.send(message);
+                                        _ = broadcast_tx.send(ConnectionEvent::Message(message));
                                     }
                                 }
                                 Err(e) => {
@@ -333,7 +353,7 @@ where
                             }
                         }
                         Ok(Message::Close(frame)) => {
-                            if let Some(observer) = observer {
+                            if let Some(observer) = &observer {
                                 observer(WebSocketObservation::CloseFrame {
                                     code: frame.as_ref().map(|frame| u16::from(frame.code)),
                                 });
@@ -371,10 +391,24 @@ where
                 }
 
                 // Handle outgoing messages from subscriptions
-                Some(text) = sender_rx.recv() => {
+                text = sender_rx.recv() => {
+                    let Some(text) = text else {
+                        let close_result = write.send(Message::Close(None)).await;
+                        heartbeat_handle.abort();
+                        close_result?;
+                        return Ok(());
+                    };
                     if write.send(Message::Text(text.into())).await.is_err() {
                         break;
                     }
+                }
+
+                // Force a reconnect through the ordinary connection shutdown path.
+                () = reconnect_notify.notified() => {
+                    let close_result = write.send(Message::Close(None)).await;
+                    heartbeat_handle.abort();
+                    close_result?;
+                    return Ok(());
                 }
 
                 // Handle PING requests from heartbeat loop
@@ -484,13 +518,15 @@ where
         *self.state_rx.borrow()
     }
 
-    /// Subscribe to incoming messages.
-    ///
-    /// Each call returns a new independent receiver. Multiple subscribers can
-    /// receive messages concurrently without blocking each other.
+    /// Subscribe to incoming messages and connection boundaries.
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<M> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ConnectionEvent<M>> {
         self.broadcast_tx.subscribe()
+    }
+
+    /// Close the active socket so the normal reconnect loop establishes a new one.
+    pub(crate) fn reconnect(&self) {
+        self.reconnect_notify.notify_one();
     }
 
     /// Subscribe to connection state changes.

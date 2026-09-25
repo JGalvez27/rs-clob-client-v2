@@ -17,7 +17,7 @@ use super::types::response::{RtdsMessage, parse_messages};
 use crate::Result;
 use crate::auth::Credentials;
 use crate::ws::ConnectionManager;
-use crate::ws::connection::ConnectionState;
+use crate::ws::connection::{ConnectionEvent, ConnectionState};
 
 #[non_exhaustive]
 #[derive(Clone)]
@@ -238,7 +238,7 @@ impl SubscriptionManager {
         Ok(try_stream! {
             loop {
                 match rx.recv().await {
-                    Ok(msg) => {
+                    Ok(ConnectionEvent::Message(msg)) => {
                         // Filter messages by topic and type
                         let matches_topic = msg.topic == target_topic;
                         let matches_type = target_type == "*" || msg.msg_type == target_type;
@@ -247,6 +247,7 @@ impl SubscriptionManager {
                             yield msg;
                         }
                     }
+                    Ok(ConnectionEvent::Reconnected) => {}
                     Err(RecvError::Lagged(n)) => {
                         #[cfg(not(feature = "tracing"))]
                         let _ = n;

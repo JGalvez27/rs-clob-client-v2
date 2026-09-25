@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use async_stream::try_stream;
 use dashmap::{DashMap, Entry};
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use tokio::sync::broadcast::error::RecvError;
 #[cfg(feature = "tracing")]
 use tracing::Instrument as _;
@@ -24,7 +24,7 @@ use crate::types::{B256, U256};
 use crate::ws::ConnectionManager;
 use crate::ws::WsError;
 use crate::ws::config::WebSocketObservation;
-use crate::ws::connection::ConnectionState;
+use crate::ws::connection::{ConnectionEvent, ConnectionState};
 
 /// What a subscription is targeting.
 #[non_exhaustive]
@@ -74,6 +74,25 @@ pub enum ChannelType {
     User,
 }
 
+/// An item from a raw market-data stream.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The broadcast already carried WsMessage by value; boxing adds a heap allocation per market message on the capture hot path"
+)]
+pub enum MarketStreamItem {
+    /// A market-data message.
+    Message(WsMessage),
+    /// The socket was re-established; every earlier item came from the old socket.
+    Reconnected,
+    /// This stream's receiver lagged the broadcast and messages were dropped.
+    Lagged {
+        /// Number of messages dropped before this item.
+        missed: u64,
+    },
+}
+
 /// Manages active subscriptions and routes messages to subscribers.
 pub struct SubscriptionManager {
     connection: ConnectionManager<WsMessage, Arc<InterestTracker>>,
@@ -109,12 +128,12 @@ impl SubscriptionManager {
 
     /// Start the reconnection handler that re-subscribes on connection recovery.
     pub fn start_reconnection_handler(self: &Arc<Self>) {
-        let this = Arc::clone(self);
+        let this = Arc::downgrade(self);
+        let mut state_rx = self.connection.state_receiver();
 
         #[cfg(feature = "tracing")]
-        let span = this.connection.span.clone();
+        let span = self.connection.span.clone();
         let handler = async move {
-            let mut state_rx = this.connection.state_receiver();
             let mut was_connected = state_rx.borrow().is_connected();
 
             loop {
@@ -125,6 +144,9 @@ impl SubscriptionManager {
                 }
 
                 let state = *state_rx.borrow_and_update();
+                let Some(this) = this.upgrade() else {
+                    break;
+                };
 
                 match state {
                     ConnectionState::Connected { .. } => {
@@ -252,6 +274,22 @@ impl SubscriptionManager {
         asset_ids: Vec<U256>,
         custom_features: bool,
     ) -> Result<impl Stream<Item = Result<WsMessage>> + use<>> {
+        let stream = self.subscribe_market_items_with_options(asset_ids, custom_features)?;
+
+        Ok(stream.filter_map(|item_result| async move {
+            match item_result {
+                Ok(MarketStreamItem::Message(message)) => Some(Ok(message)),
+                Err(error) => Some(Err(error)),
+                _ => None,
+            }
+        }))
+    }
+
+    pub(super) fn subscribe_market_items_with_options(
+        &self,
+        asset_ids: Vec<U256>,
+        custom_features: bool,
+    ) -> Result<impl Stream<Item = Result<MarketStreamItem>> + use<>> {
         if asset_ids.is_empty() {
             return Err(WsError::SubscriptionFailed(
                 "asset_ids cannot be empty: at least one asset ID must be provided for subscription"
@@ -323,12 +361,12 @@ impl SubscriptionManager {
         // Create filtered stream with its own receiver
         let mut rx = self.connection.subscribe();
         let asset_ids_set: HashSet<U256> = asset_ids.into_iter().collect();
-        let observer = self.connection.observer;
+        let observer = self.connection.observer.clone();
 
         Ok(try_stream! {
             loop {
                 match rx.recv().await {
-                    Ok(msg) => {
+                    Ok(ConnectionEvent::Message(msg)) => {
                         // Filter messages by asset_id
                         let should_yield = match &msg {
                             WsMessage::Book(book) => asset_ids_set.contains(&book.asset_id),
@@ -351,13 +389,17 @@ impl SubscriptionManager {
                         };
 
                         if should_yield {
-                            yield msg
+                            yield MarketStreamItem::Message(msg);
                         }
                     }
+                    Ok(ConnectionEvent::Reconnected) => {
+                        yield MarketStreamItem::Reconnected;
+                    }
                     Err(RecvError::Lagged(n)) => {
-                        if let Some(observer) = observer {
+                        if let Some(observer) = &observer {
                             observer(WebSocketObservation::ReceiverLagged { messages: n });
                         }
+                        yield MarketStreamItem::Lagged { missed: n };
                         #[cfg(feature = "tracing")]
                         tracing::warn!("Subscription lagged, missed {n} messages — continuing");
                     }
@@ -435,18 +477,19 @@ impl SubscriptionManager {
 
         // Create stream for user messages
         let mut rx = self.connection.subscribe();
-        let observer = self.connection.observer;
+        let observer = self.connection.observer.clone();
 
         Ok(try_stream! {
             loop {
                 match rx.recv().await {
-                    Ok(msg) => {
+                    Ok(ConnectionEvent::Message(msg)) => {
                         if msg.is_user() {
                             yield msg;
                         }
                     }
+                    Ok(ConnectionEvent::Reconnected) => {}
                     Err(RecvError::Lagged(n)) => {
-                        if let Some(observer) = observer {
+                        if let Some(observer) = &observer {
                             observer(WebSocketObservation::ReceiverLagged { messages: n });
                         }
                         #[cfg(feature = "tracing")]

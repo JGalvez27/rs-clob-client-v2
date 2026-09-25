@@ -7,7 +7,7 @@ use futures::Stream;
 use futures::StreamExt as _;
 
 use super::interest::InterestTracker;
-use super::subscription::{ChannelType, SubscriptionManager};
+use super::subscription::{ChannelType, MarketStreamItem, SubscriptionManager};
 use super::types::response::{
     BestBidAsk, BookUpdate, LastTradePrice, MarketResolved, MidpointUpdate, NewMarket,
     OrderMessage, PriceChange, TickSizeChange, TradeMessage, WsMessage,
@@ -136,8 +136,8 @@ impl Client<Unauthenticated> {
 
 // Methods available in any state
 impl<S: State> Client<S> {
-    /// Subscribes to the raw market data stream, yielding all `WsMessage` variants
-    /// in wire order from a single underlying broadcast channel.
+    /// Subscribes to the raw market data stream, yielding messages and connection
+    /// boundaries in order from a single underlying broadcast channel.
     ///
     /// Unlike the typed `subscribe_orderbook` / `subscribe_prices` / etc. methods —
     /// which each `filter_map` to a single variant and would require `select_all`
@@ -161,11 +161,11 @@ impl<S: State> Client<S> {
         &self,
         asset_ids: Vec<U256>,
         custom_features: bool,
-    ) -> Result<impl Stream<Item = Result<WsMessage>> + use<S>> {
+    ) -> Result<impl Stream<Item = Result<MarketStreamItem>> + use<S>> {
         let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
         resources
             .subscriptions
-            .subscribe_market_with_options(asset_ids, custom_features)
+            .subscribe_market_items_with_options(asset_ids, custom_features)
     }
 
     /// Subscribes to real-time orderbook updates for specified market assets.
@@ -400,6 +400,15 @@ impl<S: State> Client<S> {
             ConnectionState::Disconnected,
             ChannelResources::connection_state,
         )
+    }
+
+    /// Force the market socket through its normal reconnect and re-subscription path.
+    ///
+    /// This is a no-op until the market channel has been initialized.
+    pub fn reconnect_market(&self) {
+        if let Some(resources) = self.inner.channel(ChannelType::Market) {
+            resources.connection.reconnect();
+        }
     }
 
     /// Check if the WebSocket connection is established for a specific channel.

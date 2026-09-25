@@ -3,6 +3,8 @@
     reason = "Configuration types intentionally mirror the module name for clarity"
 )]
 
+use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
@@ -54,7 +56,7 @@ pub enum WebSocketObservation {
 
 /// Configuration for WebSocket client behavior.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Interval for sending PING messages to keep connection alive
     pub heartbeat_interval: Duration,
@@ -65,7 +67,7 @@ pub struct Config {
     /// Optional synchronous observer for WebSocket transport measurements.
     ///
     /// The callback runs inline and must not panic or block.
-    pub observer: Option<fn(WebSocketObservation)>,
+    pub observer: Option<Arc<dyn Fn(WebSocketObservation) + Send + Sync>>,
 }
 
 impl Default for Config {
@@ -76,6 +78,17 @@ impl Default for Config {
             reconnect: ReconnectConfig::default(),
             observer: None,
         }
+    }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("heartbeat_timeout", &self.heartbeat_timeout)
+            .field("reconnect", &self.reconnect)
+            .field("observer", &self.observer.as_ref().map(|_| ".."))
+            .finish()
     }
 }
 

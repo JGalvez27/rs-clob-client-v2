@@ -10,7 +10,7 @@ pub mod types;
 
 // Re-export commonly used types
 pub use client::Client;
-pub use subscription::{ChannelType, SubscriptionInfo, SubscriptionTarget};
+pub use subscription::{ChannelType, MarketStreamItem, SubscriptionInfo, SubscriptionTarget};
 pub use types::request::SubscriptionRequest;
 pub use types::response::{
     BestBidAsk, BookUpdate, EventMessage, LastTradePrice, MakerOrder, MarketResolved,
