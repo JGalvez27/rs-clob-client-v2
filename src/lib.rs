@@ -345,6 +345,7 @@ async fn request<Response: DeserializeOwned>(
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
+        name = "request",
         level = "debug",
         skip(client, observer, request, headers),
         fields(
