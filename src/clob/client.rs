@@ -55,7 +55,7 @@ use crate::clob::types::{
 };
 use crate::clob::types::{
     Amount, OrderPayload, OrderSignature, OrderType, Side, SignableOrder, SignatureType,
-    SignedOrder, TickSize, TradeStatusType,
+    SignedOrder, SigningIdentity, TickSize, TradeStatusType,
 };
 use crate::error::{Error, Kind as ErrorKind, Synchronization};
 use crate::types::{Address, B256, Decimal};
@@ -307,6 +307,81 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
         Client::<Authenticated<K>>::start_heartbeats(&mut client)?;
 
         Ok(client)
+    }
+}
+
+/// An authenticated request built exactly as the matching high-level call builds it, before its
+/// L2 headers: its method, URL, content type and body bytes. [`Client::send_prepared`] adds fresh
+/// headers to each send, so resending one transmits the same bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedRequest {
+    method: Method,
+    url: Url,
+    content_type: Option<HeaderValue>,
+    body: Option<Vec<u8>>,
+}
+
+impl PreparedRequest {
+    fn of(request: &Request) -> Self {
+        Self {
+            method: request.method().clone(),
+            url: request.url().clone(),
+            content_type: request
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .cloned(),
+            body: request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .map(<[u8]>::to_vec),
+        }
+    }
+
+    fn to_request(&self, client: &ReqwestClient) -> Result<Request> {
+        let mut builder = client.request(self.method.clone(), self.url.clone());
+        if let Some(content_type) = &self.content_type {
+            builder = builder.header(reqwest::header::CONTENT_TYPE, content_type.clone());
+        }
+        if let Some(body) = &self.body {
+            builder = builder.body(body.clone());
+        }
+        Ok(builder.build()?)
+    }
+
+    /// The request method.
+    #[must_use]
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// The request's path, without scheme, host or query.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.url.path()
+    }
+
+    /// The body bytes as they are transmitted, if any.
+    #[must_use]
+    pub fn body(&self) -> Option<&[u8]> {
+        self.body.as_deref()
+    }
+}
+
+/// The venue's first answer to a [`PreparedRequest`], exactly as received: its status and body.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawExchange {
+    /// The response status.
+    pub status: u16,
+    /// The response body exactly as received.
+    pub body: Vec<u8>,
+}
+
+impl RawExchange {
+    /// Whether the status is a success.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
     }
 }
 
@@ -661,6 +736,12 @@ impl<S: State> Client<S> {
     /// ```
     pub fn set_neg_risk(&self, token_id: U256, neg_risk: bool) {
         self.inner.neg_risk.insert(token_id, neg_risk);
+    }
+
+    /// Pre-populates the CLOB protocol version cache, avoiding the `/version` call: token-id
+    /// orders are then built for `version` until a version mismatch refreshes it.
+    pub fn set_version(&self, version: u32) {
+        self.inner.cached_version.store(version, Ordering::Relaxed);
     }
 
     /// Pre-populates the fee rate cache for a token, avoiding the HTTP call.
@@ -1942,6 +2023,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         let config = contract_config(chain_id, neg_risk)
             .ok_or(Error::missing_contract_config(chain_id, neg_risk))?;
 
+        let signing;
         let signature = match &payload {
             OrderPayload::V2(p) | OrderPayload::V3(p) => {
                 let (exchange, version) = if is_v3 {
@@ -1966,6 +2048,13 @@ impl<K: Kind> Client<Authenticated<K>> {
                     verifying_contract: Some(exchange),
                     ..Eip712Domain::default()
                 };
+                signing = Some(SigningIdentity {
+                    domain_version: if is_v3 { "3" } else { "2" },
+                    exchange,
+                    chain_id,
+                    neg_risk,
+                    order_hash: p.order.eip712_signing_hash(&domain),
+                });
                 if p.order.signatureType == SignatureType::Poly1271 as u8 {
                     self.sign_poly1271_order(signer, &p.order, &domain, chain_id)
                         .await?
@@ -1984,6 +2073,13 @@ impl<K: Kind> Client<Authenticated<K>> {
                     verifying_contract: Some(config.exchange),
                     ..Eip712Domain::default()
                 };
+                signing = Some(SigningIdentity {
+                    domain_version: "1",
+                    exchange: config.exchange,
+                    chain_id,
+                    neg_risk,
+                    order_hash: p.order.eip712_signing_hash(&domain),
+                });
                 signer
                     .sign_hash(&p.order.eip712_signing_hash(&domain))
                     .await?
@@ -1998,6 +2094,7 @@ impl<K: Kind> Client<Authenticated<K>> {
             owner: self.state().credentials.key,
             post_only,
             defer_exec,
+            signing,
         })
     }
 
@@ -2046,6 +2143,114 @@ impl<K: Kind> Client<Authenticated<K>> {
         Ok(OrderSignature::Wrapped(wrapped))
     }
 
+    /// Prepares `order`'s submission exactly as [`Self::post_order`] builds it, without sending
+    /// it: [`Self::send_prepared`] transmits it, and a resend transmits the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be built.
+    pub fn prepare_post_order(&self, order: &SignedOrder) -> Result<PreparedRequest> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}order", self.host()))
+            .json(order)
+            .build()?;
+        Ok(PreparedRequest::of(&request))
+    }
+
+    /// Prepares the cancellation of `order_id` exactly as [`Self::cancel_order`] builds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be built.
+    pub fn prepare_cancel_order(&self, order_id: &str) -> Result<PreparedRequest> {
+        let request = self
+            .client()
+            .request(Method::DELETE, format!("{}order", self.host()))
+            .json(&json!({ "orderID": order_id }))
+            .build()?;
+        Ok(PreparedRequest::of(&request))
+    }
+
+    /// Prepares the cancellation of `order_ids` exactly as [`Self::cancel_orders`] builds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be built.
+    pub fn prepare_cancel_orders(&self, order_ids: &[&str]) -> Result<PreparedRequest> {
+        let request = self
+            .client()
+            .request(Method::DELETE, format!("{}orders", self.host()))
+            .json(&json!(order_ids))
+            .build()?;
+        Ok(PreparedRequest::of(&request))
+    }
+
+    /// Prepares the cancellation of every open order exactly as [`Self::cancel_all_orders`]
+    /// builds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be built.
+    pub fn prepare_cancel_all_orders(&self) -> Result<PreparedRequest> {
+        let request = self
+            .client()
+            .request(Method::DELETE, format!("{}cancel-all", self.host()))
+            .build()?;
+        Ok(PreparedRequest::of(&request))
+    }
+
+    /// Prepares a market's cancellation exactly as [`Self::cancel_market_orders`] builds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be built.
+    pub fn prepare_cancel_market_orders(
+        &self,
+        request: &CancelMarketOrderRequest,
+    ) -> Result<PreparedRequest> {
+        let request = self
+            .client()
+            .request(
+                Method::DELETE,
+                format!("{}cancel-market-orders", self.host()),
+            )
+            .json(&request)
+            .build()?;
+        Ok(PreparedRequest::of(&request))
+    }
+
+    /// Prepares a heartbeat exactly as [`Self::post_heartbeat`] builds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be built.
+    pub fn prepare_heartbeat(&self, heartbeat_id: Option<Uuid>) -> Result<PreparedRequest> {
+        let request = self
+            .client()
+            .request(Method::POST, format!("{}v1/heartbeats", self.host()))
+            .json(&json!({ "heartbeat_id": heartbeat_id }))
+            .build()?;
+        Ok(PreparedRequest::of(&request))
+    }
+
+    /// Sends `prepared` with fresh L2 headers and returns the venue's first answer as received,
+    /// whatever its status: nothing waits for settlement-hash enrichment, nothing is parsed, and
+    /// no observer is called (the caller records the exchange with its own identity).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the headers cannot be made, or the request or its body read fails.
+    pub async fn send_prepared(&self, prepared: &PreparedRequest) -> Result<RawExchange> {
+        let mut request = prepared.to_request(self.client())?;
+        let headers = self.create_headers(&request).await?;
+        request.headers_mut().extend(headers);
+        let response = self.client().execute(request).await?;
+        let status = response.status().as_u16();
+        let body = response.bytes().await?.to_vec();
+        Ok(RawExchange { status, body })
+    }
+
     /// Posts a signed order to the orderbook.
     ///
     /// Submits a single limit or market order that has been signed with the
@@ -2068,11 +2273,7 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// [`trade_ids`](PostOrderResponse::trade_ids).
     pub async fn post_order(&self, order: SignedOrder) -> Result<PostOrderResponse> {
         let defer_exec = order.defer_exec == Some(true);
-        let request = self
-            .client()
-            .request(Method::POST, format!("{}order", self.host()))
-            .json(&order)
-            .build()?;
+        let request = self.prepare_post_order(&order)?.to_request(self.client())?;
         let headers = self.create_headers(&request).await?;
 
         let result = crate::request_observed(
@@ -2281,10 +2482,8 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// or the request fails.
     pub async fn cancel_order(&self, order_id: &str) -> Result<CancelOrdersResponse> {
         let request = self
-            .client()
-            .request(Method::DELETE, format!("{}order", self.host()))
-            .json(&json!({ "orderID": order_id }))
-            .build()?;
+            .prepare_cancel_order(order_id)?
+            .to_request(self.client())?;
         let headers = self.create_headers(&request).await?;
 
         crate::request_observed(
@@ -2307,10 +2506,8 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if any order ID is invalid or the request fails.
     pub async fn cancel_orders(&self, order_ids: &[&str]) -> Result<CancelOrdersResponse> {
         let request = self
-            .client()
-            .request(Method::DELETE, format!("{}orders", self.host()))
-            .json(&json!(order_ids))
-            .build()?;
+            .prepare_cancel_orders(order_ids)?
+            .to_request(self.client())?;
         let headers = self.create_headers(&request).await?;
 
         crate::request_observed(
@@ -2332,9 +2529,8 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if the request fails.
     pub async fn cancel_all_orders(&self) -> Result<CancelOrdersResponse> {
         let request = self
-            .client()
-            .request(Method::DELETE, format!("{}cancel-all", self.host()))
-            .build()?;
+            .prepare_cancel_all_orders()?
+            .to_request(self.client())?;
         let headers = self.create_headers(&request).await?;
 
         crate::request_observed(
@@ -2353,13 +2549,8 @@ impl<K: Kind> Client<Authenticated<K>> {
         request: &CancelMarketOrderRequest,
     ) -> Result<CancelOrdersResponse> {
         let request = self
-            .client()
-            .request(
-                Method::DELETE,
-                format!("{}cancel-market-orders", self.host()),
-            )
-            .json(&request)
-            .build()?;
+            .prepare_cancel_market_orders(request)?
+            .to_request(self.client())?;
         let headers = self.create_headers(&request).await?;
 
         crate::request_observed(
@@ -3042,10 +3233,8 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if the request fails.
     pub async fn post_heartbeat(&self, heartbeat_id: Option<Uuid>) -> Result<HeartbeatResponse> {
         let request = self
-            .client()
-            .request(Method::POST, format!("{}v1/heartbeats", self.host()))
-            .json(&json!({ "heartbeat_id": heartbeat_id }))
-            .build()?;
+            .prepare_heartbeat(heartbeat_id)?
+            .to_request(self.client())?;
         let headers = self.create_headers(&request).await?;
 
         crate::request_observed(

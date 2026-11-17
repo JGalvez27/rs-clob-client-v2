@@ -161,4 +161,4 @@ pub mod utilities;
 #[cfg(feature = "ws")]
 pub mod ws;
 
-pub use client::{Client, Config};
+pub use client::{Client, Config, PreparedRequest, RawExchange};

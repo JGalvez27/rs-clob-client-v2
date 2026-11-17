@@ -1,6 +1,6 @@
 use std::fmt;
 
-use alloy::primitives::{B256, Signature, U256};
+use alloy::primitives::{Address, B256, Signature, U256};
 use bon::Builder;
 use rust_decimal_macros::dec;
 use serde::ser::{Error as _, SerializeStruct as _};
@@ -746,6 +746,26 @@ pub struct SignedOrder {
     pub owner: ApiKey,
     pub post_only: Option<bool>,
     pub defer_exec: Option<bool>,
+    /// What [`Client::sign`](crate::clob::Client::sign) signed against; never serialized, so
+    /// the request body is unchanged. `None` for an order not signed by this client.
+    pub signing: Option<SigningIdentity>,
+}
+
+/// The EIP-712 domain an order was signed under, and the order's hash in it: the hash the
+/// exchange identifies the order by.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SigningIdentity {
+    /// The domain's version: `"1"` legacy, `"2"` token orders, `"3"` position orders.
+    pub domain_version: &'static str,
+    /// The verifying exchange contract.
+    pub exchange: Address,
+    /// The chain id.
+    pub chain_id: u64,
+    /// Whether the neg-risk exchange was selected (always `false` for position orders).
+    pub neg_risk: bool,
+    /// The order's EIP-712 signing hash under that domain.
+    pub order_hash: B256,
 }
 
 /// Signature material attached to a signed order.
@@ -1166,6 +1186,7 @@ mod tests {
             owner: ApiKey::nil(),
             post_only: None,
             defer_exec: None,
+            signing: None,
         };
 
         let value = to_value(&signed_order).expect("serialize SignedOrder");
@@ -1186,6 +1207,7 @@ mod tests {
             owner: ApiKey::nil(),
             post_only: None,
             defer_exec: Some(false),
+            signing: None,
         };
 
         let value = to_value(&signed_order).expect("serialize SignedOrder");
@@ -1214,6 +1236,7 @@ mod tests {
             owner: ApiKey::nil(),
             post_only: None,
             defer_exec: None,
+            signing: None,
         };
 
         let value = to_value(&signed_order).expect("serialize SignedOrder");
