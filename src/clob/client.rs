@@ -446,6 +446,9 @@ pub struct Config {
     #[builder(default = Duration::from_secs(5))]
     /// How often the [`Client`] will automatically submit heartbeats. The default is five (5) seconds.
     heartbeat_interval: Duration,
+    /// An opt-in observer of every HTTP response this client receives, before it is parsed.
+    /// Request headers, which carry the authentication, never reach it.
+    http_observer: Option<crate::HttpObserver>,
 }
 
 impl Default for Config {
@@ -456,6 +459,7 @@ impl Default for Config {
             builder_code: None,
             #[cfg(feature = "heartbeats")]
             heartbeat_interval: Duration::from_secs(5),
+            http_observer: None,
         }
     }
 }
@@ -505,7 +509,13 @@ impl<S: State> ClientInner<S> {
             .request(Method::GET, format!("{}time", self.host))
             .build()?;
 
-        crate::request(&self.client, request, None).await
+        crate::request_observed(
+            &self.client,
+            self.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 }
 
@@ -521,7 +531,13 @@ impl ClientInner<Unauthenticated> {
             .build()?;
         let headers = self.create_headers(signer, nonce).await?;
 
-        crate::request(&self.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.client,
+            self.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     pub async fn derive_api_key<S: Signer>(
@@ -535,7 +551,13 @@ impl ClientInner<Unauthenticated> {
             .build()?;
         let headers = self.create_headers(signer, nonce).await?;
 
-        crate::request(&self.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.client,
+            self.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     async fn create_or_derive_api_key<S: Signer>(
@@ -687,7 +709,13 @@ impl<S: State> Client<S> {
             .request(Method::GET, self.host().to_owned())
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Returns the current server timestamp in milliseconds since Unix epoch.
@@ -727,7 +755,13 @@ impl<S: State> Client<S> {
             .client()
             .request(Method::GET, format!("{}version", self.host()))
             .build()?;
-        let body: VersionBody = crate::request(&self.inner.client, request, None).await?;
+        let body: VersionBody = crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await?;
         self.inner
             .cached_version
             .store(body.version, Ordering::Relaxed);
@@ -750,7 +784,13 @@ impl<S: State> Client<S> {
             .request(Method::GET, format!("{}midpoint{params}", self.host()))
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves midpoint prices for multiple exchange assets in a single request.
@@ -768,7 +808,13 @@ impl<S: State> Client<S> {
             .json(requests)
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves the current price for an exchange asset on a specific side.
@@ -786,7 +832,13 @@ impl<S: State> Client<S> {
             .request(Method::GET, format!("{}price{params}", self.host()))
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves prices for multiple exchange assets on their specific sides.
@@ -804,7 +856,13 @@ impl<S: State> Client<S> {
             .json(requests)
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves historical price data for an exchange asset.
@@ -825,7 +883,13 @@ impl<S: State> Client<S> {
             format!("{}prices-history{params}", self.host()),
         );
 
-        crate::request(&self.inner.client, req.build()?, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            req.build()?,
+            None,
+        )
+        .await
     }
 
     /// Retrieves the bid-ask spread for a single exchange asset.
@@ -844,7 +908,13 @@ impl<S: State> Client<S> {
             .request(Method::GET, format!("{}spread{params}", self.host()))
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves bid-ask spreads for multiple exchange assets.
@@ -862,7 +932,13 @@ impl<S: State> Client<S> {
             .json(requests)
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves the minimum tick size for a CTF token or Polymarket V2 position.
@@ -1064,7 +1140,13 @@ impl<S: State> Client<S> {
             )
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves the full orderbook for a CTF token or Polymarket V2 position.
@@ -1086,7 +1168,13 @@ impl<S: State> Client<S> {
             .request(Method::GET, format!("{}book{params}", self.host()))
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves orderbooks for multiple CTF tokens or Polymarket V2 positions.
@@ -1107,7 +1195,13 @@ impl<S: State> Client<S> {
             .json(requests)
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Hash of an order-book summary, for change-detection against the server's `hash`.
@@ -1140,7 +1234,13 @@ impl<S: State> Client<S> {
             )
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves the last trade prices for multiple CTF tokens or Polymarket V2 positions.
@@ -1161,7 +1261,13 @@ impl<S: State> Client<S> {
             .json(token_ids)
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves detailed information for a single market by condition ID.
@@ -1181,7 +1287,13 @@ impl<S: State> Client<S> {
             )
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves a page of all active markets.
@@ -1200,7 +1312,13 @@ impl<S: State> Client<S> {
             .request(Method::GET, format!("{}markets{cursor}", self.host()))
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves a page of sampling markets.
@@ -1225,7 +1343,13 @@ impl<S: State> Client<S> {
             )
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves a page of simplified market data.
@@ -1250,7 +1374,13 @@ impl<S: State> Client<S> {
             )
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Retrieves a page of simplified sampling market data.
@@ -1275,7 +1405,13 @@ impl<S: State> Client<S> {
             )
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Returns a stream of results, using `self` to repeatedly invoke the provided closure,
@@ -1326,8 +1462,13 @@ impl<S: State> Client<S> {
             )
             .build()?;
 
-        let response: ClobMarketInfoResponse =
-            crate::request(&self.inner.client, request, None).await?;
+        let response: ClobMarketInfoResponse = crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await?;
 
         // Do NOT populate `fee_rate_bps` here — that cache belongs to the V1 `/fee-rate`
         // endpoint, which uses different units.
@@ -1408,7 +1549,13 @@ impl<S: State> Client<S> {
             )
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Returns raw on-chain trade events for a market condition ID.
@@ -1425,7 +1572,13 @@ impl<S: State> Client<S> {
             )
             .build()?;
 
-        crate::request(&self.inner.client, request, None).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            None,
+        )
+        .await
     }
 
     /// Calculates the effective fill price for a market order by walking the orderbook.
@@ -1678,7 +1831,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Deletes the current API key used by this authenticated client.
@@ -1696,7 +1855,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Checks if the account is in closed-only mode (banned from opening new positions).
@@ -1718,7 +1883,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Creates an [`OrderBuilder<Limit, K>`] used to construct a limit order.
@@ -1904,7 +2075,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        let result = crate::request(&self.inner.client, request, Some(headers)).await;
+        let result = crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await;
         self.invalidate_version_if_mismatch(&result).await;
         let response = result?;
         if defer_exec {
@@ -1934,7 +2111,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        let result = crate::request(&self.inner.client, request, Some(headers)).await;
+        let result = crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await;
         self.invalidate_version_if_mismatch(&result).await;
         let mut responses: Vec<PostOrderResponse> = result?;
 
@@ -2048,7 +2231,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Retrieves a paginated list of orders matching the specified criteria.
@@ -2072,7 +2261,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Cancels a single order by its order ID.
@@ -2092,7 +2287,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Cancels multiple orders by their order IDs in a single request.
@@ -2112,7 +2313,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Cancels all open orders for the authenticated user.
@@ -2130,7 +2337,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Attempts to cancel all open orders for a particular [`CancelMarketOrderRequest::market`]
@@ -2149,7 +2362,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Retrieves a paginated list of trades for the authenticated user.
@@ -2173,7 +2392,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Retrieves all notifications for the authenticated user.
@@ -2192,7 +2417,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Deletes notifications matching the specified IDs.
@@ -2247,7 +2478,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Forces an update of the cached balance and allowance data.
@@ -2303,7 +2540,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Checks if multiple orders are eligible for market maker rewards.
@@ -2322,7 +2565,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Retrieves detailed market maker earnings for a specific day.
@@ -2352,7 +2601,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Retrieves total market maker earnings summary for a specific day.
@@ -2380,7 +2635,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Retrieves user earnings along with market reward configurations.
@@ -2410,7 +2671,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Retrieves the user's current reward earning percentages.
@@ -2435,7 +2702,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Retrieves current active reward programs and their configurations.
@@ -2461,7 +2734,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Retrieves detailed reward data for a specific market.
@@ -2487,7 +2766,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Creates a new read-only API key.
@@ -2505,7 +2790,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Lists all read-only API keys.
@@ -2529,8 +2820,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        let body: ReadonlyApiKeysBody =
-            crate::request(&self.inner.client, request, Some(headers)).await?;
+        let body: ReadonlyApiKeysBody = crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await?;
         Ok(body.readonly_api_keys)
     }
 
@@ -2586,7 +2882,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Gets the builder fee rate for a given builder code.
@@ -2610,8 +2912,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        let response: BuilderFeeRateResponse =
-            crate::request(&self.inner.client, request, Some(headers)).await?;
+        let response: BuilderFeeRateResponse = crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await?;
 
         self.inner
             .builder_fee_rates
@@ -2636,7 +2943,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Lists all Builder API keys issued to the authenticated account.
@@ -2651,7 +2964,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Revokes the Builder API key associated with the authenticated account.
@@ -2703,7 +3022,13 @@ impl<K: Kind> Client<Authenticated<K>> {
         let request = self.client().request(Method::GET, url).build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Posts a heartbeat to maintain order liveness.
@@ -2723,7 +3048,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            request,
+            Some(headers),
+        )
+        .await
     }
 
     #[cfg(feature = "heartbeats")]
@@ -2847,7 +3178,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&http_request).await?;
 
-        crate::request(&self.inner.client, http_request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            http_request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Cancels an RFQ request.
@@ -2893,7 +3230,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&http_request).await?;
 
-        crate::request(&self.inner.client, http_request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            http_request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Creates an RFQ Quote in response to a Request.
@@ -2913,7 +3256,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&http_request).await?;
 
-        crate::request(&self.inner.client, http_request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            http_request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Cancels an RFQ quote.
@@ -2957,7 +3306,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&http_request).await?;
 
-        crate::request(&self.inner.client, http_request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            http_request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Requester accepts an RFQ Quote.
@@ -3003,7 +3358,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&http_request).await?;
 
-        crate::request(&self.inner.client, http_request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            self.inner.config.http_observer.as_ref(),
+            http_request,
+            Some(headers),
+        )
+        .await
     }
 
     /// Helper method for RFQ endpoints that return plain text instead of JSON.

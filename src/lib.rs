@@ -252,11 +252,101 @@ impl<T: Serialize> ToQueryParams for T {}
     feature = "data",
     feature = "gamma"
 ))]
+/// One HTTP response as it arrived, before it is parsed: what an [`HttpObserver`] sees.
+///
+/// It carries the request's method and target and the response's status and body. Request
+/// headers, which carry the authentication, are never part of it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct HttpExchange<'response> {
+    /// The request method.
+    pub method: &'response reqwest::Method,
+    /// The request's path and query, without scheme or host.
+    pub path_and_query: &'response str,
+    /// The response status.
+    pub status: u16,
+    /// The response body exactly as received.
+    pub body: &'response [u8],
+}
+
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
+type HttpObserverFn = dyn Fn(&HttpExchange<'_>) + Send + Sync;
+
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
+/// An opt-in synchronous observer of every HTTP response a client receives, called with the
+/// response's raw body before it is parsed: raw capture of the wire.
+///
+/// The callback runs inline and must not panic or block.
+#[derive(Clone)]
+pub struct HttpObserver(std::sync::Arc<HttpObserverFn>);
+
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
+impl HttpObserver {
+    /// An observer calling `observe` with each response.
+    pub fn new<F>(observe: F) -> Self
+    where
+        F: Fn(&HttpExchange<'_>) + Send + Sync + 'static,
+    {
+        Self(std::sync::Arc::new(observe))
+    }
+
+    fn observe(&self, exchange: &HttpExchange<'_>) {
+        (self.0)(exchange);
+    }
+}
+
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
+impl std::fmt::Debug for HttpObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HttpObserver(..)")
+    }
+}
+
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
+async fn request<Response: DeserializeOwned>(
+    client: &reqwest::Client,
+    request: Request,
+    headers: Option<HeaderMap>,
+) -> Result<Response> {
+    request_observed(client, None, request, headers).await
+}
+
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
         level = "debug",
-        skip(client, request, headers),
+        skip(client, observer, request, headers),
         fields(
             method = %request.method(),
             path = request.url().path(),
@@ -264,13 +354,18 @@ impl<T: Serialize> ToQueryParams for T {}
         )
     )
 )]
-async fn request<Response: DeserializeOwned>(
+async fn request_observed<Response: DeserializeOwned>(
     client: &reqwest::Client,
+    observer: Option<&HttpObserver>,
     mut request: Request,
     headers: Option<HeaderMap>,
 ) -> Result<Response> {
     let method = request.method().clone();
     let path = request.url().path().to_owned();
+    let observed_target = observer.map(|_| match request.url().query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.clone(),
+    });
 
     if let Some(h) = headers {
         request.headers_mut().extend(h);
@@ -284,6 +379,14 @@ async fn request<Response: DeserializeOwned>(
 
     if !status_code.is_success() {
         let message = response.text().await.unwrap_or_default();
+        if let (Some(observer), Some(target)) = (observer, observed_target.as_deref()) {
+            observer.observe(&HttpExchange {
+                method: &method,
+                path_and_query: target,
+                status: status_code.as_u16(),
+                body: message.as_bytes(),
+            });
+        }
 
         #[cfg(feature = "tracing")]
         tracing::warn!(
@@ -297,7 +400,19 @@ async fn request<Response: DeserializeOwned>(
         return Err(Error::status(status_code, method, path, message));
     }
 
-    let json_value = response.json::<serde_json::Value>().await?;
+    let json_value = match (observer, observed_target.as_deref()) {
+        (Some(observer), Some(target)) => {
+            let body = response.bytes().await?;
+            observer.observe(&HttpExchange {
+                method: &method,
+                path_and_query: target,
+                status: status_code.as_u16(),
+                body: &body,
+            });
+            serde_json::from_slice::<serde_json::Value>(&body)?
+        }
+        _ => response.json::<serde_json::Value>().await?,
+    };
     let response_data: Option<Response> = serde_helpers::deserialize_with_warnings(json_value)?;
 
     if let Some(response) = response_data {

@@ -54,6 +54,9 @@ pub enum WebSocketObservation {
     },
 }
 
+/// A synchronous observer of each received text frame, exactly as received.
+pub type FrameObserver = dyn Fn(&str) + Send + Sync;
+
 /// Configuration for WebSocket client behavior.
 #[non_exhaustive]
 #[derive(Clone)]
@@ -68,6 +71,12 @@ pub struct Config {
     ///
     /// The callback runs inline and must not panic or block.
     pub observer: Option<Arc<dyn Fn(WebSocketObservation) + Send + Sync>>,
+    /// Optional synchronous observer of every received non-PONG text frame, called with the
+    /// frame exactly as received, before it is parsed: raw capture of the wire.
+    ///
+    /// The callback runs inline and must not panic or block. When `None`, a frame costs one
+    /// check of this option and nothing else.
+    pub frame_observer: Option<Arc<FrameObserver>>,
 }
 
 impl Default for Config {
@@ -77,6 +86,7 @@ impl Default for Config {
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT_DURATION,
             reconnect: ReconnectConfig::default(),
             observer: None,
+            frame_observer: None,
         }
     }
 }
@@ -88,6 +98,10 @@ impl fmt::Debug for Config {
             .field("heartbeat_timeout", &self.heartbeat_timeout)
             .field("reconnect", &self.reconnect)
             .field("observer", &self.observer.as_ref().map(|_| ".."))
+            .field(
+                "frame_observer",
+                &self.frame_observer.as_ref().map(|_| ".."),
+            )
             .finish()
     }
 }

@@ -299,6 +299,7 @@ where
         let (pong_tx, pong_rx) = watch::channel(Instant::now());
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
         let observer = config.observer.clone();
+        let frame_observer = config.frame_observer.clone();
 
         let heartbeat_task = async move {
             Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
@@ -316,6 +317,9 @@ where
                             _ = pong_tx.send(Instant::now());
                         }
                         Ok(Message::Text(text)) => {
+                            if let Some(frame_observer) = &frame_observer {
+                                frame_observer(text.as_str());
+                            }
                             if let Some(observer) = &observer {
                                 observer(WebSocketObservation::TextMessage { bytes: text.len() });
                             }
