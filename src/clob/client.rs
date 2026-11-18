@@ -524,6 +524,10 @@ pub struct Config {
     /// An opt-in observer of every HTTP response this client receives, before it is parsed.
     /// Request headers, which carry the authentication, never reach it.
     http_observer: Option<crate::HttpObserver>,
+    /// The total time one HTTP request may take, connection through the end of its body
+    /// (reqwest's [`reqwest::ClientBuilder::timeout`]). It applies to every request of the
+    /// [`Client`], [`Client::send_prepared`] included. `None`, the default, sets no limit.
+    timeout: Option<Duration>,
 }
 
 impl Default for Config {
@@ -535,6 +539,7 @@ impl Default for Config {
             #[cfg(feature = "heartbeats")]
             heartbeat_interval: Duration::from_secs(5),
             http_observer: None,
+            timeout: None,
         }
     }
 }
@@ -1728,7 +1733,11 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        let mut builder = ReqwestClient::builder().default_headers(headers);
+        if let Some(timeout) = config.timeout {
+            builder = builder.timeout(timeout);
+        }
+        let client = builder.build()?;
 
         let geoblock_host = Url::parse(
             config
@@ -2216,6 +2225,32 @@ impl<K: Kind> Client<Authenticated<K>> {
                 format!("{}cancel-market-orders", self.host()),
             )
             .json(&request)
+            .build()?;
+        Ok(PreparedRequest::of(&request))
+    }
+
+    /// Prepares a balance and allowance read exactly as [`Self::balance_allowance`] builds it,
+    /// its signature type defaulted to the client's the same way. [`Self::send_prepared`] then
+    /// returns its answer to the caller alone, so no other request's answer can stand for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be built.
+    pub fn prepare_balance_allowance(
+        &self,
+        mut request: BalanceAllowanceRequest,
+    ) -> Result<PreparedRequest> {
+        if request.signature_type.is_none() {
+            request.signature_type = Some(self.inner.signature_type);
+        }
+
+        let params = request.query_params(None);
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}balance-allowance{params}", self.host()),
+            )
             .build()?;
         Ok(PreparedRequest::of(&request))
     }
