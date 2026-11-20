@@ -2255,6 +2255,21 @@ impl<K: Kind> Client<Authenticated<K>> {
         Ok(PreparedRequest::of(&request))
     }
 
+    /// Prepares the read of one order exactly as [`Self::order`] builds it. [`Self::send_prepared`]
+    /// then returns its answer to the caller alone, so no other read of the same order can stand
+    /// for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request cannot be built.
+    pub fn prepare_order(&self, order_id: &str) -> Result<PreparedRequest> {
+        let request = self
+            .client()
+            .request(Method::GET, format!("{}data/order/{order_id}", self.host()))
+            .build()?;
+        Ok(PreparedRequest::of(&request))
+    }
+
     /// Prepares a heartbeat exactly as [`Self::post_heartbeat`] builds it.
     ///
     /// # Errors
