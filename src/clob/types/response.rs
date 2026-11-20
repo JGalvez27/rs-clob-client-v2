@@ -9,8 +9,8 @@ use bon::Builder;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{
-    DefaultOnError, DefaultOnNull, DisplayFromStr, NoneAsEmptyString, TimestampMilliSeconds,
-    TimestampSeconds, TryFromInto, serde_as,
+    DefaultOnError, DefaultOnNull, DisplayFromStr, NoneAsEmptyString, PickFirst,
+    TimestampMilliSeconds, TimestampSeconds, TryFromInto, serde_as,
 };
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -529,6 +529,7 @@ pub struct UserInfo {
 }
 
 #[non_exhaustive]
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize, Builder, PartialEq)]
 #[builder(on(String, into))]
 pub struct MakerOrder {
@@ -537,7 +538,11 @@ pub struct MakerOrder {
     pub maker_address: Address,
     pub matched_amount: Decimal,
     pub price: Decimal,
-    pub fee_rate_bps: Decimal,
+    /// The maker order's fee rate in basis points. `/data/trades` sends it as an empty string
+    /// on recent trades' maker orders, which reads as `None`; "0" and other numbers read as
+    /// `Some`.
+    #[serde_as(as = "PickFirst<(Option<_>, NoneAsEmptyString)>")]
+    pub fee_rate_bps: Option<Decimal>,
     pub asset_id: U256,
     pub outcome: String,
     pub side: Side,

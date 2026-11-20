@@ -2390,7 +2390,7 @@ mod authenticated {
                                 "maker_address": "0x6666666666666666666666666666666666666666",
                                 "matched_amount": "7.5",
                                 "price": "0.42",
-                                "fee_rate_bps": "5",
+                                "fee_rate_bps": "",
                                 "asset_id": token_1(),
                                 "outcome": "YES",
                                 "side": "SELL"
@@ -2450,7 +2450,6 @@ mod authenticated {
                     .maker_address(address!("0x6666666666666666666666666666666666666666"))
                     .matched_amount(dec!(7.5))
                     .price(dec!(0.42))
-                    .fee_rate_bps(dec!(5))
                     .asset_id(token_1())
                     .outcome("YES")
                     .side(Side::Sell)
